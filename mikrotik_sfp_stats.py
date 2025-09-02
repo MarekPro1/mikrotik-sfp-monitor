@@ -66,20 +66,6 @@ class MikroTikSFPCollector:
         self.error_history = {}  # Track error history for rate calculation
         self.last_clear_time = 0  # Track last screen clear to reduce blinking
     
-    def load_hosts_from_file(self, filename: str = 'mikrotik_hosts.txt') -> List[str]:
-        """Load host IPs from configuration file"""
-        hosts = []
-        if os.path.exists(filename):
-            print(f"Loading hosts from {filename}...")
-            with open(filename, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        hosts.append(line)
-            if hosts:
-                print(f"  Loaded {len(hosts)} host(s) from configuration file")
-        return hosts
-    
     def discover_mikrotik_devices(self, timeout: float = 15.0) -> List[Dict]:
         """Discover MikroTik devices using MNDP (MikroTik Neighbor Discovery Protocol)"""
         print("Discovering MikroTik devices using MNDP protocol...")
@@ -105,11 +91,13 @@ class MikroTikSFPCollector:
                 print("  Note: Could not bind to MNDP port 5678, using alternative port")
             
             # Send multiple discovery packets to ensure all devices respond
-            print("  Sending discovery packets...")
-            for i in range(5):  # More attempts
-                discovery_packet = b'\x00\x00\x00\x00'
-                sock.sendto(discovery_packet, (MNDP_MULTICAST, MNDP_PORT))
-                time.sleep(0.2)  # Slightly longer delay
+            # Send in bursts for better coverage
+            for burst in range(3):  # 3 bursts
+                for i in range(5):  # 5 packets per burst
+                    discovery_packet = b'\x00\x00\x00\x00'
+                    sock.sendto(discovery_packet, (MNDP_MULTICAST, MNDP_PORT))
+                    time.sleep(0.05)  # Very fast within burst
+                time.sleep(0.3)  # Pause between bursts
             
             # Collect responses
             start_time = time.time()
@@ -124,7 +112,7 @@ class MikroTikSFPCollector:
                         if device_info:
                             devices.append(device_info)
                             seen_devices.add(addr[0])
-                            print(f"  Found: {device_info['identity']} at {device_info['ip']}")
+                            # Don't print during continuous discovery
                 except socket.timeout:
                     continue
                 except Exception as e:
@@ -186,36 +174,6 @@ class MikroTikSFPCollector:
         except Exception as e:
             return None
     
-    def scan_network(self, network: str, timeout: float = 1.0) -> List[str]:
-        """Fallback: Scan network for MikroTik devices by checking API port"""
-        print(f"Scanning network {network} for MikroTik devices (API port check)...")
-        mikrotik_ips = []
-        
-        try:
-            net = ipaddress.IPv4Network(network, strict=False)
-        except ValueError as e:
-            print(f"Invalid network: {e}")
-            return mikrotik_ips
-        
-        # Only check a subset of IPs to avoid timeout
-        hosts = list(net.hosts())[:20]  # Limit to first 20 hosts for testing
-        
-        for ip in hosts:
-            ip_str = str(ip)
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            
-            try:
-                result = sock.connect_ex((ip_str, self.port))
-                if result == 0:
-                    mikrotik_ips.append(ip_str)
-                    print(f"  Found MikroTik device at {ip_str}")
-            except socket.error:
-                pass
-            finally:
-                sock.close()
-        
-        return mikrotik_ips
     
     def get_sfp_stats_api(self, host: str) -> Dict:
         """Get SFP statistics using RouterOS API"""
@@ -599,7 +557,7 @@ class MikroTikSFPCollector:
         error_diff = newest_in_window - oldest_in_window
         return max(0, error_diff)  # Ensure non-negative
     
-    def print_monitoring_summary(self):
+    def print_monitoring_summary(self, device_count=0):
         """Print compact monitoring summary for terminal - errors and rates only"""
         # Only clear screen every 5 seconds to reduce blinking
         current_time = time.time()
@@ -616,6 +574,7 @@ class MikroTikSFPCollector:
         # Header with timestamp
         print(f"{Fore.CYAN}{Style.BRIGHT}{'='*80}{Style.RESET_ALL}")
         print(f"{Fore.CYAN}{Style.BRIGHT}MIKROTIK SFP MONITORING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{Style.RESET_ALL}")
+        print(f"{Fore.YELLOW}Monitoring {device_count} device(s) - Discovery running in background{Style.RESET_ALL}")
         if self.reset_time:
             elapsed = (datetime.now() - self.reset_time).total_seconds()
             print(f"{Fore.GREEN}Counters reset {int(elapsed)} seconds ago - showing delta values{Style.RESET_ALL}")
@@ -828,19 +787,16 @@ class MikroTikSFPCollector:
         print(f"\n{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
         print(f"{Fore.YELLOW}Press 'R' to reset counters | Ctrl+C to stop monitoring{Style.RESET_ALL}")
     
-    def print_results(self, format: str = 'table'):
-        """Print collected results"""
-        if format == 'json':
-            print(json.dumps(self.results, indent=2))
-        else:
-            # Table format
-            print("\n" + "="*100)
-            print("SFP PORT STATISTICS SUMMARY")
-            print("="*100)
-            
-            # First, show ports with errors at the top
-            error_summary = []
-            for device in self.results:
+    def print_results(self):
+        """Print collected results to terminal"""
+        # Table format only
+        print("\n" + "="*100)
+        print("SFP PORT STATISTICS SUMMARY")
+        print("="*100)
+        
+        # First, show ports with errors at the top
+        error_summary = []
+        for device in self.results:
                 if device['error']:
                     continue
                 for sfp in device['sfp_ports']:
@@ -885,129 +841,118 @@ class MikroTikSFPCollector:
                             },
                             'total_errors': total_errors
                         })
+        
+        # Print error summary if errors found
+        if error_summary:
+            print("\n" + "!"*80)
+            print("!!! ATTENTION: PORTS WITH ERRORS DETECTED !!!")
+            print("!"*80)
+            # Sort by total errors descending
+            error_summary.sort(key=lambda x: x['total_errors'], reverse=True)
             
-            # Print error summary if errors found
-            if error_summary:
-                print("\n" + "!"*80)
-                print("!!! ATTENTION: PORTS WITH ERRORS DETECTED !!!")
-                print("!"*80)
-                # Sort by total errors descending
-                error_summary.sort(key=lambda x: x['total_errors'], reverse=True)
+            for err in error_summary:
+                print(f"\n>>> {err['device']} ({err['ip']}) - Port: {err['interface']}")
+                print(f"    TOTAL ERRORS: {err['total_errors']:,}")
+                # Show only non-zero error types
+                error_details = []
+                for err_type, count in err['errors'].items():
+                    if count > 0:
+                        error_details.append(f"{err_type}: {count:,}")
+                if error_details:
+                    print(f"    ERROR BREAKDOWN: {', '.join(error_details)}")
                 
-                for err in error_summary:
-                    print(f"\n>>> {err['device']} ({err['ip']}) - Port: {err['interface']}")
-                    print(f"    TOTAL ERRORS: {err['total_errors']:,}")
-                    # Show only non-zero error types
-                    error_details = []
-                    for err_type, count in err['errors'].items():
-                        if count > 0:
-                            error_details.append(f"{err_type}: {count:,}")
-                    if error_details:
-                        print(f"    ERROR BREAKDOWN: {', '.join(error_details)}")
-                    
-                    # Add severity indicator
-                    if err['total_errors'] > 1000:
-                        print("    >>> CRITICAL: High error rate - check cable/SFP immediately!")
-                    elif err['total_errors'] > 100:
-                        print("    >>> WARNING: Moderate errors - monitor closely")
-                    else:
-                        print("    >>> INFO: Low error count - may be transient")
-                
-                print("\n" + "!"*80)
-                print()
-            else:
-                print("\n" + "="*80)
-                print("=== SUCCESS: No errors detected on any SFP ports ===")
-                print("="*80)
-            
-            for device in self.results:
-                if device['error']:
-                    print(f"\n[ERROR] {device['host']} - {device['error']}")
-                    continue
-                
-                print(f"\nDevice: {device['hostname']} ({device['host']})")
-                print("-"*80)
-                
-                if not device['sfp_ports']:
-                    print("  No SFP ports found or no SFP modules installed")
+                # Add severity indicator
+                if err['total_errors'] > 1000:
+                    print("    >>> CRITICAL: High error rate - check cable/SFP immediately!")
+                elif err['total_errors'] > 100:
+                    print("    >>> WARNING: Moderate errors - monitor closely")
                 else:
-                    for sfp in device['sfp_ports']:
-                        print(f"\n  Interface: {sfp['interface']}")
-                        print(f"    Status: {sfp['status']}")
-                        print(f"    Vendor: {sfp['sfp_vendor']}")
-                        print(f"    Part Number: {sfp['sfp_part_number']}")
-                        print(f"    Wavelength: {sfp['sfp_wavelength']} nm")
-                        print(f"    Temperature: {sfp['sfp_temperature']}")
-                        print(f"    RX Power: {sfp['sfp_rx_power']}")
-                        print(f"    TX Power: {sfp['sfp_tx_power']}")
-                        print(f"    Rate: {sfp['rate']}")
+                    print("    >>> INFO: Low error count - may be transient")
+            
+            print("\n" + "!"*80)
+            print()
+        else:
+            print("\n" + "="*80)
+            print("=== SUCCESS: No errors detected on any SFP ports ===")
+            print("="*80)
+        
+        for device in self.results:
+            if device['error']:
+                print(f"\n[ERROR] {device['host']} - {device['error']}")
+                continue
+            
+            print(f"\nDevice: {device['hostname']} ({device['host']})")
+            print("-"*80)
+            
+            if not device['sfp_ports']:
+                print("  No SFP ports found or no SFP modules installed")
+            else:
+                for sfp in device['sfp_ports']:
+                    print(f"\n  Interface: {sfp['interface']}")
+                    print(f"    Status: {sfp['status']}")
+                    print(f"    Vendor: {sfp['sfp_vendor']}")
+                    print(f"    Part Number: {sfp['sfp_part_number']}")
+                    print(f"    Wavelength: {sfp['sfp_wavelength']} nm")
+                    print(f"    Temperature: {sfp['sfp_temperature']}")
+                    print(f"    RX Power: {sfp['sfp_rx_power']}")
+                    print(f"    TX Power: {sfp['sfp_tx_power']}")
+                    print(f"    Rate: {sfp['rate']}")
+                    
+                    if 'rx_bytes' in sfp:
+                        print(f"    Traffic Statistics:")
+                        print(f"      RX Bytes: {sfp.get('rx_bytes', 0):,}")
+                        print(f"      RX Packets: {sfp.get('rx_packets', 0):,}")
+                        print(f"      TX Bytes: {sfp.get('tx_bytes', 0):,}")
+                        print(f"      TX Packets: {sfp.get('tx_packets', 0):,}")
                         
-                        if 'rx_bytes' in sfp:
-                            print(f"    Traffic Statistics:")
-                            print(f"      RX Bytes: {sfp.get('rx_bytes', 0):,}")
-                            print(f"      RX Packets: {sfp.get('rx_packets', 0):,}")
-                            print(f"      TX Bytes: {sfp.get('tx_bytes', 0):,}")
-                            print(f"      TX Packets: {sfp.get('tx_packets', 0):,}")
-                            
-                            print(f"    Error Statistics:")
-                            print(f"      RX Errors: {sfp.get('rx_errors', 0):,}")
-                            print(f"      RX Drops: {sfp.get('rx_drops', 0):,}")
-                            print(f"      TX Errors: {sfp.get('tx_errors', 0):,}")
-                            print(f"      TX Drops: {sfp.get('tx_drops', 0):,}")
-                            print(f"      FCS Errors: {sfp.get('rx_fcs_error', 0):,}")
-                            print(f"      Alignment Errors: {sfp.get('rx_align_error', 0):,}")
-                            print(f"      Fragments: {sfp.get('rx_fragment', 0):,}")
-                            print(f"      Overflow: {sfp.get('rx_overflow', 0):,}")
-                            print(f"      Too Long: {sfp.get('rx_too_long', 0):,}")
-                            print(f"      Too Short: {sfp.get('rx_too_short', 0):,}")
-                            
-                            if sfp.get('tx_collision', 0) > 0 or sfp.get('tx_late_collision', 0) > 0:
-                                print(f"    Collision Statistics:")
-                                print(f"      Collisions: {sfp.get('tx_collision', 0):,}")
-                                print(f"      Excessive Collisions: {sfp.get('tx_excessive_collision', 0):,}")
-                                print(f"      Late Collisions: {sfp.get('tx_late_collision', 0):,}")
-                            
-                            # Show packet size distribution if any packets received
-                            if sfp.get('rx_packets', 0) > 0:
-                                print(f"    Packet Size Distribution:")
-                                print(f"      64 bytes: {sfp.get('rx_64', 0):,}")
-                                print(f"      65-127 bytes: {sfp.get('rx_65_127', 0):,}")
-                                print(f"      128-255 bytes: {sfp.get('rx_128_255', 0):,}")
-                                print(f"      256-511 bytes: {sfp.get('rx_256_511', 0):,}")
-                                print(f"      512-1023 bytes: {sfp.get('rx_512_1023', 0):,}")
-                                print(f"      1024-1518 bytes: {sfp.get('rx_1024_1518', 0):,}")
-                                print(f"      1519+ bytes: {sfp.get('rx_1519_max', 0):,}")
-            
-            print("\n" + "="*100)
-            
-            # Summary
-            total_devices = len(self.results)
-            successful = sum(1 for d in self.results if not d['error'])
-            total_sfp = sum(len(d['sfp_ports']) for d in self.results)
-            
-            print(f"\nSummary: {successful}/{total_devices} devices queried successfully")
-            print(f"Total SFP ports found: {total_sfp}")
+                        print(f"    Error Statistics:")
+                        print(f"      RX Errors: {sfp.get('rx_errors', 0):,}")
+                        print(f"      RX Drops: {sfp.get('rx_drops', 0):,}")
+                        print(f"      TX Errors: {sfp.get('tx_errors', 0):,}")
+                        print(f"      TX Drops: {sfp.get('tx_drops', 0):,}")
+                        print(f"      FCS Errors: {sfp.get('rx_fcs_error', 0):,}")
+                        print(f"      Alignment Errors: {sfp.get('rx_align_error', 0):,}")
+                        print(f"      Fragments: {sfp.get('rx_fragment', 0):,}")
+                        print(f"      Overflow: {sfp.get('rx_overflow', 0):,}")
+                        print(f"      Too Long: {sfp.get('rx_too_long', 0):,}")
+                        print(f"      Too Short: {sfp.get('rx_too_short', 0):,}")
+                        
+                        if sfp.get('tx_collision', 0) > 0 or sfp.get('tx_late_collision', 0) > 0:
+                            print(f"    Collision Statistics:")
+                            print(f"      Collisions: {sfp.get('tx_collision', 0):,}")
+                            print(f"      Excessive Collisions: {sfp.get('tx_excessive_collision', 0):,}")
+                            print(f"      Late Collisions: {sfp.get('tx_late_collision', 0):,}")
+                        
+                        # Show packet size distribution if any packets received
+                        if sfp.get('rx_packets', 0) > 0:
+                            print(f"    Packet Size Distribution:")
+                            print(f"      64 bytes: {sfp.get('rx_64', 0):,}")
+                            print(f"      65-127 bytes: {sfp.get('rx_65_127', 0):,}")
+                            print(f"      128-255 bytes: {sfp.get('rx_128_255', 0):,}")
+                            print(f"      256-511 bytes: {sfp.get('rx_256_511', 0):,}")
+                            print(f"      512-1023 bytes: {sfp.get('rx_512_1023', 0):,}")
+                            print(f"      1024-1518 bytes: {sfp.get('rx_1024_1518', 0):,}")
+                            print(f"      1519+ bytes: {sfp.get('rx_1519_max', 0):,}")
+        
+        print("\n" + "="*100)
+        
+        # Summary
+        total_devices = len(self.results)
+        successful = sum(1 for d in self.results if not d['error'])
+        total_sfp = sum(len(d['sfp_ports']) for d in self.results)
+        
+        print(f"\nSummary: {successful}/{total_devices} devices queried successfully")
+        print(f"Total SFP ports found: {total_sfp}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Collect SFP port statistics from MikroTik routers')
+    parser = argparse.ArgumentParser(description='Monitor SFP port statistics from MikroTik routers using MNDP discovery')
     parser.add_argument('-u', '--username', required=True, help='RouterOS username')
     parser.add_argument('-p', '--password', required=True, help='RouterOS password')
-    parser.add_argument('-n', '--network', help='Network to scan (e.g., 192.168.1.0/24)')
-    parser.add_argument('-H', '--hosts', nargs='+', help='Specific hosts to connect to')
-    parser.add_argument('--no-discover', action='store_true', help='Disable automatic MNDP discovery')
     parser.add_argument('--port', type=int, default=8728, help='RouterOS API port (default: 8728)')
-    parser.add_argument('--ssh', action='store_true', help='Use SSH instead of API')
-    parser.add_argument('--ssh-port', type=int, default=22, help='SSH port (default: 22)')
-    parser.add_argument('-f', '--format', choices=['table', 'json', 'both'], default='both', 
-                       help='Output format (default: both)')
-    parser.add_argument('-o', '--output', default='mikrotik_sfp_report', 
-                       help='Output filename prefix (default: mikrotik_sfp_report)')
     parser.add_argument('-w', '--workers', type=int, default=5, 
                        help='Maximum concurrent connections (default: 5)')
-    parser.add_argument('--no-console', action='store_true', help='Suppress console output (only save to files)')
-    parser.add_argument('-m', '--monitor', action='store_true', help='Continuous monitoring mode (1 second refresh)')
-    parser.add_argument('--interval', type=int, default=1, help='Monitoring interval in seconds (default: 1)')
+    parser.add_argument('--interval', type=int, default=1, help='Refresh interval in seconds (default: 1)')
     
     args = parser.parse_args()
     
@@ -1016,163 +961,125 @@ def main():
         username=args.username,
         password=args.password,
         port=args.port,
-        ssh_port=args.ssh_port,
-        use_ssh=args.ssh
+        ssh_port=22,
+        use_ssh=False
     )
     
-    # Determine hosts to connect to
-    hosts = []
-    discovered_ips = set()
+    # Start with continuous discovery and monitoring
+    print("Starting MikroTik SFP Monitor with continuous device discovery...")
+    print(f"Refresh interval: {args.interval} second(s)")
+    print("Press 'R' to reset counters, Ctrl+C to stop...\n")
     
-    if args.hosts:
-        hosts = args.hosts
-        print(f"Using specified hosts: {', '.join(hosts)}")
-    elif not args.no_discover:
-        # First, try MNDP discovery
-        print("Auto-discovering MikroTik devices...")
-        devices = collector.discover_mikrotik_devices(timeout=15)
-        if devices:
-            discovered_ips = {device['ip'] for device in devices}
-            print(f"\nDiscovered {len(devices)} device(s) via MNDP:")
-            for device in devices:
-                print(f"  - {device['identity']} ({device['ip']})")
-        
-        # Then, load hosts from configuration file
-        config_hosts = collector.load_hosts_from_file()
-        
-        # Combine discovered and configured hosts
-        all_hosts = discovered_ips.union(set(config_hosts))
-        hosts = list(all_hosts)
-        
-        if len(hosts) > len(discovered_ips):
-            print(f"\nUsing {len(hosts)} total hosts (MNDP + config file)")
-        elif not hosts:
-            print("\nNo MikroTik devices found via MNDP or config file")
-            print("Please create 'mikrotik_hosts.txt' with your device IPs")
-            print("Or use --hosts to specify IPs manually")
-            return
-    elif args.network:
-        hosts = collector.scan_network(args.network)
-        if not hosts:
-            print("No MikroTik devices found on the network")
-            return
-    else:
-        print("Error: Specify --hosts, enable discovery (default), or use --network")
-        parser.print_help()
-        return
+    # Shared list of discovered hosts (thread-safe)
+    discovered_hosts = set()
+    hosts_lock = threading.Lock()
     
-    # Collect statistics
-    if hosts:
-        if args.monitor:
-            # Continuous monitoring mode
-            print(f"\nStarting continuous monitoring of {len(hosts)} device(s)...")
-            print(f"Refresh interval: {args.interval} second(s)")
-            print("Press 'R' to reset counters, Ctrl+C to stop...\n")
-            time.sleep(2)
-            
-            # Flag for reset request
-            reset_requested = threading.Event()
-            
-            # Keyboard listener thread (Windows only for now)
-            def keyboard_listener():
-                while True:
-                    try:
-                        if os.name == 'nt' and msvcrt.kbhit():
-                            key = msvcrt.getch()
-                            if key in [b'r', b'R']:
-                                reset_requested.set()
-                        time.sleep(0.1)
-                    except:
-                        break
-            
-            if os.name == 'nt':
-                kb_thread = threading.Thread(target=keyboard_listener, daemon=True)
-                kb_thread.start()
-            
+    # Discovery thread - continuously discovers devices
+    def continuous_discovery():
+        discovery_count = 0
+        while True:
             try:
-                iteration = 0
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                # More aggressive discovery for first minute
+                if discovery_count < 12:  # First 12 attempts (1 minute)
+                    timeout = 8
+                    sleep_time = 5  # Every 5 seconds initially
+                else:
+                    timeout = 5
+                    sleep_time = 15  # Every 15 seconds after initial period
                 
-                while True:
-                    # Check for reset request
+                devices = collector.discover_mikrotik_devices(timeout=timeout)
+                if devices:
+                    with hosts_lock:
+                        for device in devices:
+                            if device['ip'] not in discovered_hosts:
+                                discovered_hosts.add(device['ip'])
+                                print(f"\n[NEW DEVICE] Found: {device['identity']} ({device['ip']})")
+                discovery_count += 1
+                time.sleep(sleep_time)
+            except:
+                time.sleep(5)
+    
+    discovery_thread = threading.Thread(target=continuous_discovery, daemon=True)
+    discovery_thread.start()
+    
+    # Initial discovery with longer timeout - do it twice for better coverage
+    print("Performing initial device discovery (this may take up to 30 seconds)...")
+    for attempt in range(2):
+        devices = collector.discover_mikrotik_devices(timeout=10)
+        if devices:
+            for device in devices:
+                if device['ip'] not in discovered_hosts:
+                    discovered_hosts.add(device['ip'])
+                    print(f"  - {device['identity']} ({device['ip']}")
+        if attempt == 0:
+            time.sleep(2)  # Short pause between attempts
+    
+    # Start monitoring even if no devices initially found
+    if True:  # Always start monitoring
+        time.sleep(2)
+        
+        # Flag for reset request
+        reset_requested = threading.Event()
+        
+        # Keyboard listener thread (Windows only for now)
+        def keyboard_listener():
+            while True:
+                try:
+                    if os.name == 'nt' and msvcrt.kbhit():
+                        key = msvcrt.getch()
+                        if key in [b'r', b'R']:
+                            reset_requested.set()
+                    time.sleep(0.1)
+                except:
+                    break
+        
+        if os.name == 'nt':
+            kb_thread = threading.Thread(target=keyboard_listener, daemon=True)
+            kb_thread.start()
+        
+        try:
+            iteration = 0
+            
+            while True:
+                # Get current list of hosts
+                with hosts_lock:
+                    current_hosts = list(discovered_hosts)
+                
+                # Skip if no hosts discovered yet
+                if not current_hosts:
+                    print("\rWaiting for devices to be discovered...", end="")
+                    time.sleep(1)
+                    continue
+                
+                # Check for reset request
+                if reset_requested.is_set():
+                    reset_requested.clear()
+                    # Clear screen and show reset message
+                    os.system('cls' if os.name == 'nt' else 'clear')
+                    collector.reset_interface_counters(current_hosts)
+                    iteration = 0  # Reset iteration counter
+                    continue
+                
+                # Collect stats
+                collector.results = []  # Clear previous results
+                collector.collect_from_hosts(current_hosts, max_workers=args.workers, quiet=True)
+                
+                # Update error history for rate calculation
+                collector.update_error_history()
+                
+                # Show compact monitoring view in terminal
+                collector.print_monitoring_summary(device_count=len(current_hosts))
+                
+                iteration += 1
+                
+                # Check for keyboard input during sleep
+                for _ in range(int(args.interval * 10)):
                     if reset_requested.is_set():
-                        reset_requested.clear()
-                        # Clear screen and show reset message
-                        os.system('cls' if os.name == 'nt' else 'clear')
-                        collector.reset_interface_counters(hosts)
-                        iteration = 0  # Reset iteration counter
-                        continue
-                    
-                    # Collect stats
-                    collector.results = []  # Clear previous results
-                    collector.collect_from_hosts(hosts, max_workers=args.workers, quiet=True)
-                    
-                    # Update error history for rate calculation
-                    collector.update_error_history()
-                    
-                    # Show compact monitoring view in terminal
-                    collector.print_monitoring_summary()
-                    
-                    # Save detailed report to file every 10 iterations
-                    if iteration % 10 == 0:
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        
-                        # Save JSON
-                        json_file = f"{args.output}_{timestamp}.json"
-                        with open(json_file, 'w') as f:
-                            json.dump(collector.results, f, indent=2)
-                        
-                        # Save detailed text report
-                        txt_file = f"{args.output}_{timestamp}.txt"
-                        import sys
-                        original_stdout = sys.stdout
-                        with open(txt_file, 'w') as f:
-                            sys.stdout = f
-                            collector.print_results(format='table')
-                        sys.stdout = original_stdout
-                    
-                    iteration += 1
-                    
-                    # Check for keyboard input during sleep
-                    for _ in range(int(args.interval * 10)):
-                        if reset_requested.is_set():
-                            break
-                        time.sleep(0.1)
-                    
-            except KeyboardInterrupt:
-                print("\n\nMonitoring stopped by user.")
-                print(f"Last report saved with timestamp: {timestamp}")
+                        break
+                    time.sleep(0.1)
                 
-        else:
-            # Single run mode
-            print(f"\nCollecting statistics from {len(hosts)} device(s)...")
-            collector.collect_from_hosts(hosts, max_workers=args.workers)
-            
-            # Save results to files
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            
-            # Save JSON if requested
-            if args.format in ['json', 'both']:
-                json_file = f"{args.output}_{timestamp}.json"
-                with open(json_file, 'w') as f:
-                    json.dump(collector.results, f, indent=2)
-                print(f"\nJSON report saved to: {json_file}")
-            
-            # Save text report if requested
-            if args.format in ['table', 'both']:
-                txt_file = f"{args.output}_{timestamp}.txt"
-                import sys
-                original_stdout = sys.stdout
-                with open(txt_file, 'w') as f:
-                    sys.stdout = f
-                    collector.print_results(format='table')
-                sys.stdout = original_stdout
-                print(f"Text report saved to: {txt_file}")
-            
-            # Always print to console unless explicitly disabled
-            if not args.no_console:
-                print("\n" + "="*100)
-                collector.print_results(format='table' if args.format != 'json' else 'json')
+        except KeyboardInterrupt:
+            print("\n\nMonitoring stopped by user.")
     else:
         print("No hosts to connect to")
 
