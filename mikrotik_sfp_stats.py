@@ -65,6 +65,8 @@ class MikroTikSFPCollector:
         self.reset_time = None  # Track when reset was pressed
         self.error_history = {}  # Track error history for rate calculation
         self.last_clear_time = 0  # Track last screen clear to reduce blinking
+        self.previous_stats = {}  # Store previous stats for rate calculation
+        self.last_collection_time = {}  # Store last collection time for each port
     
     def discover_mikrotik_devices(self, timeout: float = 15.0) -> List[Dict]:
         """Discover MikroTik devices using MNDP (MikroTik Neighbor Discovery Protocol)"""
@@ -481,6 +483,42 @@ class MikroTikSFPCollector:
         time.sleep(3)  # Give user time to see the message
         return len(self.baseline_stats)
     
+    def get_traffic_rate(self, device_ip: str, port: str, current_rx: int, current_tx: int) -> tuple:
+        """Calculate traffic rate in Mbps based on time difference"""
+        current_time = time.time()
+        key = f"{device_ip}_{port}"
+        
+        # Initialize if not exists
+        if key not in self.previous_stats:
+            self.previous_stats[key] = {'rx': current_rx, 'tx': current_tx}
+            self.last_collection_time[key] = current_time
+            return (0.0, 0.0)
+        
+        # Calculate time difference
+        time_diff = current_time - self.last_collection_time[key]
+        if time_diff <= 0:
+            return (0.0, 0.0)
+        
+        # Calculate byte difference
+        rx_diff = current_rx - self.previous_stats[key]['rx']
+        tx_diff = current_tx - self.previous_stats[key]['tx']
+        
+        # Handle counter wraparound
+        if rx_diff < 0:
+            rx_diff = current_rx
+        if tx_diff < 0:
+            tx_diff = current_tx
+        
+        # Calculate rate in Mbps
+        rx_mbps = (rx_diff * 8) / (time_diff * 1_000_000)
+        tx_mbps = (tx_diff * 8) / (time_diff * 1_000_000)
+        
+        # Update stored values
+        self.previous_stats[key] = {'rx': current_rx, 'tx': current_tx}
+        self.last_collection_time[key] = current_time
+        
+        return (rx_mbps, tx_mbps)
+    
     def get_delta_value(self, device_ip: str, port: str, field: str, current_value):
         """Calculate delta from baseline if exists"""
         if not self.baseline_stats or device_ip not in self.baseline_stats:
@@ -622,13 +660,16 @@ class MikroTikSFPCollector:
             if device['error']:
                 continue
             for sfp in device['sfp_ports']:
-                # Calculate current rate in Mbps
-                rx_mbps = (sfp.get('rx_bytes', 0) * 8) / 1_000_000 / 10  # Rough estimate
-                tx_mbps = (sfp.get('tx_bytes', 0) * 8) / 1_000_000 / 10
-                
-                # Get delta values if baseline exists
+                # Get device and port info
                 device_ip = device['host']
                 port_name = sfp['interface']
+                
+                # Calculate actual traffic rate in Mbps/s
+                rx_mbps, tx_mbps = self.get_traffic_rate(
+                    device_ip, port_name,
+                    sfp.get('rx_bytes', 0),
+                    sfp.get('tx_bytes', 0)
+                )
                 
                 # Calculate delta values for all error types
                 rx_errors = self.get_delta_value(device_ip, port_name, 'rx_errors', sfp.get('rx_errors', 0))
@@ -657,8 +698,8 @@ class MikroTikSFPCollector:
                     'temp': sfp.get('sfp_temperature', 'N/A'),
                     'errors': total_errors,
                     'fcs': fcs_errors,
-                    'rx_bytes': self.get_delta_value(device_ip, port_name, 'rx_bytes', sfp.get('rx_bytes', 0)),
-                    'tx_bytes': self.get_delta_value(device_ip, port_name, 'tx_bytes', sfp.get('tx_bytes', 0))
+                    'rx_mbps': rx_mbps,  # Use calculated rate
+                    'tx_mbps': tx_mbps   # Use calculated rate
                 })
         
         # Show ports with errors first
@@ -718,10 +759,10 @@ class MikroTikSFPCollector:
         
         # Show all ports status in compact format
         print(f"\n{Fore.GREEN}{Style.BRIGHT}[*] ALL PORTS STATUS:{Style.RESET_ALL}")
-        print(f"{Fore.GREEN}{'-'*80}{Style.RESET_ALL}")
-        header = f"{Fore.WHITE}{Style.BRIGHT}{'Device':20s} {'Port':15s} {'Status':10s} {'Rate':8s} {'Temp':6s} {'RX/TX Power':15s} {'Errors':8s}{Style.RESET_ALL}"
+        print(f"{Fore.GREEN}{'-'*110}{Style.RESET_ALL}")
+        header = f"{Fore.WHITE}{Style.BRIGHT}{'Device':20s} {'Port':15s} {'Status':10s} {'Traffic (Mbps)':16s} {'Rate':8s} {'Temp':6s} {'Power':12s} {'Errors':8s}{Style.RESET_ALL}"
         print(header)
-        print(f"{Fore.WHITE}{'-'*80}{Style.RESET_ALL}")
+        print(f"{Fore.WHITE}{'-'*110}{Style.RESET_ALL}")
         
         # Sort ports by IP address first, then by port name
         def port_sort_key(port):
@@ -733,6 +774,30 @@ class MikroTikSFPCollector:
             return (ip_tuple, port['port'])
         
         for port in sorted(all_ports, key=port_sort_key):
+            # Use the pre-calculated traffic rates
+            rx_mbps = port.get('rx_mbps', 0)
+            tx_mbps = port.get('tx_mbps', 0)
+            
+            # Format traffic string with color coding
+            traffic_str = f"{rx_mbps:.1f}/{tx_mbps:.1f}"
+            total_mbps = rx_mbps + tx_mbps
+            
+            # Color code traffic based on utilization
+            if total_mbps > 8000:  # >8Gbps
+                traffic_color = Fore.RED
+            elif total_mbps > 5000:  # >5Gbps
+                traffic_color = Fore.MAGENTA
+            elif total_mbps > 1000:  # >1Gbps
+                traffic_color = Fore.YELLOW
+            elif total_mbps > 100:  # >100Mbps
+                traffic_color = Fore.CYAN
+            elif total_mbps > 10:  # >10Mbps
+                traffic_color = Fore.GREEN
+            elif total_mbps > 0:
+                traffic_color = Fore.WHITE
+            else:
+                traffic_color = Fore.BLUE  # No traffic
+            
             # Color code based on status
             if port['status'] == 'link-ok':
                 status_color = Fore.GREEN
@@ -768,8 +833,10 @@ class MikroTikSFPCollector:
             else:
                 temp_str = "N/A"
             
-            # Format power levels with color
-            power_str = f"{port['rx_power']}/{port['tx_power']}"
+            # Format power levels (truncate if too long)
+            rx_pwr = str(port['rx_power'])[:5] if port['rx_power'] != 'N/A' else 'N/A'
+            tx_pwr = str(port['tx_power'])[:5] if port['tx_power'] != 'N/A' else 'N/A'
+            power_str = f"{rx_pwr}/{tx_pwr}"
             
             # Color code rate
             if '10Gbps' in port['rate']:
@@ -781,8 +848,18 @@ class MikroTikSFPCollector:
             
             print(f"{Fore.WHITE}{port['device']:20s} {port['port']:15s}{Style.RESET_ALL} "
                   f"{status_color}{status_text:10s}{Style.RESET_ALL} "
+                  f"{traffic_color}{traffic_str:16s}{Style.RESET_ALL} "
                   f"{rate_color}{port['rate']:8s}{Style.RESET_ALL} "
-                  f"{temp_str:14s} {power_str:15s} {error_str:8s}")
+                  f"{temp_str:6s} {power_str:12s} {error_str:8s}")
+        
+        # Show traffic legend
+        print(f"\n{Fore.CYAN}{Style.BRIGHT}[*] TRAFFIC LEGEND (RX/TX Mbps):{Style.RESET_ALL}")
+        print(f"  {Fore.BLUE}■ 0 Mbps (Idle){Style.RESET_ALL} | "
+              f"{Fore.GREEN}■ 10+ Mbps{Style.RESET_ALL} | "
+              f"{Fore.CYAN}■ 100+ Mbps{Style.RESET_ALL} | "
+              f"{Fore.YELLOW}■ 1+ Gbps{Style.RESET_ALL} | "
+              f"{Fore.MAGENTA}■ 5+ Gbps{Style.RESET_ALL} | "
+              f"{Fore.RED}■ 8+ Gbps (Heavy){Style.RESET_ALL}")
         
         print(f"\n{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
         print(f"{Fore.YELLOW}Press 'R' to reset counters | Ctrl+C to stop monitoring{Style.RESET_ALL}")
