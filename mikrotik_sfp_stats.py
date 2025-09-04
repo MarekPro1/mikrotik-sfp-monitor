@@ -67,6 +67,31 @@ class MikroTikSFPCollector:
         self.last_clear_time = 0  # Track last screen clear to reduce blinking
         self.previous_stats = {}  # Store previous stats for rate calculation
         self.last_collection_time = {}  # Store last collection time for each port
+        self.link_state_history = {}  # Track link up/down events
+        self.packet_size_dist = {}  # Store packet size distribution
+        self.pause_frames = {}  # Track pause frame counts
+        self.queue_drops = {}  # Track queue drop rates
+    
+    def load_hosts_from_file(self, filename: str = "mikrotik_hosts.txt") -> List[str]:
+        """Load host IPs from configuration file"""
+        hosts = []
+        if os.path.exists(filename):
+            try:
+                with open(filename, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        # Skip comments and empty lines
+                        if line and not line.startswith('#'):
+                            # Validate IP address
+                            try:
+                                ipaddress.ip_address(line)
+                                hosts.append(line)
+                                print(f"  Loaded host from config: {line}")
+                            except ValueError:
+                                print(f"  Warning: Invalid IP address in config: {line}")
+            except Exception as e:
+                print(f"  Error reading config file: {e}")
+        return hosts
     
     def discover_mikrotik_devices(self, timeout: float = 15.0) -> List[Dict]:
         """Discover MikroTik devices using MNDP (MikroTik Neighbor Discovery Protocol)"""
@@ -210,6 +235,13 @@ class MikroTikSFPCollector:
                     stats['architecture'] = res.get('architecture-name', 'Unknown')
                     stats['uptime'] = res.get('uptime', 'Unknown')
                     stats['cpu_load'] = res.get('cpu-load', 0)
+                    # Add memory statistics
+                    stats['total_memory'] = res.get('total-memory', 0)
+                    stats['free_memory'] = res.get('free-memory', 0)
+                    if stats['total_memory'] > 0:
+                        stats['memory_usage_percent'] = int(((stats['total_memory'] - stats['free_memory']) / stats['total_memory']) * 100)
+                    else:
+                        stats['memory_usage_percent'] = 0
             except:
                 pass
             
@@ -280,6 +312,15 @@ class MikroTikSFPCollector:
                                 # Get ethernet stats for more detailed error information
                                 eth_stats = list(api('/interface/ethernet/print'))
                                 
+                                # Get system resource info for enhanced monitoring
+                                queue_stats = []
+                                try:
+                                    # Try to get queue statistics
+                                    queue_query = api('/queue/simple/print')
+                                    queue_stats = list(queue_query)
+                                except:
+                                    pass
+                                
                                 # Find statistics for this specific interface
                                 for st in stats_list:
                                     if st.get('name') == if_name:
@@ -316,8 +357,54 @@ class MikroTikSFPCollector:
                                             'tx_collision': int(eth.get('tx-collision', 0)),
                                             'tx_excessive_collision': int(eth.get('tx-excessive-collision', 0)),
                                             'tx_late_collision': int(eth.get('tx-late-collision', 0)),
-                                            'tx_pause': int(eth.get('tx-pause', 0))
+                                            'tx_pause': int(eth.get('tx-pause', 0)),
+                                            'tx_queue_drop': int(eth.get('tx-queue-drop', 0)),
+                                            'link_downs': int(eth.get('link-downs', 0))
                                         })
+                                        
+                                        # Store packet size distribution
+                                        key = f"{host}_{if_name}"
+                                        self.packet_size_dist[key] = {
+                                            '64': sfp_info.get('rx_64', 0),
+                                            '65-127': sfp_info.get('rx_65_127', 0),
+                                            '128-255': sfp_info.get('rx_128_255', 0),
+                                            '256-511': sfp_info.get('rx_256_511', 0),
+                                            '512-1023': sfp_info.get('rx_512_1023', 0),
+                                            '1024-1518': sfp_info.get('rx_1024_1518', 0),
+                                            '1519+': sfp_info.get('rx_1519_max', 0)
+                                        }
+                                        
+                                        # Store pause frame info
+                                        self.pause_frames[key] = {
+                                            'rx': sfp_info.get('rx_pause', 0),
+                                            'tx': sfp_info.get('tx_pause', 0)
+                                        }
+                                        
+                                        # Track link state changes
+                                        if key not in self.link_state_history:
+                                            self.link_state_history[key] = {
+                                                'link_downs': sfp_info.get('link_downs', 0),
+                                                'last_state': sfp_info.get('status', 'unknown'),
+                                                'flap_count': 0,
+                                                'last_change': time.time()
+                                            }
+                                        else:
+                                            current_downs = sfp_info.get('link_downs', 0)
+                                            if current_downs > self.link_state_history[key]['link_downs']:
+                                                self.link_state_history[key]['flap_count'] += 1
+                                                self.link_state_history[key]['link_downs'] = current_downs
+                                                self.link_state_history[key]['last_change'] = time.time()
+                                        
+                                        break
+                                
+                                # Track queue drops if available
+                                for q in queue_stats:
+                                    if q.get('target') and if_name in q.get('target', ''):
+                                        key = f"{host}_{if_name}"
+                                        self.queue_drops[key] = {
+                                            'drops': int(q.get('drops', 0)),
+                                            'queued': int(q.get('queued-packets', 0))
+                                        }
                                         break
                                 
                                 stats['sfp_ports'].append(sfp_info)
@@ -482,6 +569,25 @@ class MikroTikSFPCollector:
         print(f"{Fore.YELLOW}{'='*60}{Style.RESET_ALL}")
         time.sleep(3)  # Give user time to see the message
         return len(self.baseline_stats)
+    
+    def calculate_error_rate(self, device_ip: str, port: str, errors: int, packets: int) -> float:
+        """Calculate error rate per million packets"""
+        if packets <= 0:
+            return 0.0
+        return (errors / packets) * 1_000_000
+    
+    def get_packet_size_distribution(self, device_ip: str, port: str) -> dict:
+        """Get packet size distribution percentages"""
+        key = f"{device_ip}_{port}"
+        if key not in self.packet_size_dist:
+            return {}
+        
+        dist = self.packet_size_dist[key]
+        total = sum(dist.values())
+        if total == 0:
+            return {}
+        
+        return {size: (count / total * 100) for size, count in dist.items()}
     
     def get_traffic_rate(self, device_ip: str, port: str, current_rx: int, current_tx: int) -> tuple:
         """Calculate traffic rate in Mbps based on time difference"""
@@ -687,6 +793,23 @@ class MikroTikSFPCollector:
                     fcs_errors + align_errors + fragment + overflow
                 )
                 
+                # Calculate error rate per million packets
+                total_packets = self.get_delta_value(device_ip, port_name, 'rx_packets', sfp.get('rx_packets', 0)) + \
+                                self.get_delta_value(device_ip, port_name, 'tx_packets', sfp.get('tx_packets', 0))
+                error_rate = self.calculate_error_rate(device_ip, port_name, total_errors, total_packets)
+                
+                # Get pause frame counts
+                key = f"{device_ip}_{port_name}"
+                pause_rx = self.pause_frames.get(key, {}).get('rx', 0)
+                pause_tx = self.pause_frames.get(key, {}).get('tx', 0)
+                
+                # Get queue drops
+                queue_drops = self.get_delta_value(device_ip, port_name, 'tx_queue_drop', sfp.get('tx_queue_drop', 0))
+                
+                # Get link flap info
+                link_info = self.link_state_history.get(key, {})
+                flap_count = link_info.get('flap_count', 0)
+                
                 all_ports.append({
                     'device': device['hostname'],
                     'ip': device['host'],
@@ -698,8 +821,19 @@ class MikroTikSFPCollector:
                     'temp': sfp.get('sfp_temperature', 'N/A'),
                     'errors': total_errors,
                     'fcs': fcs_errors,
+                    'align': align_errors,
+                    'fragments': fragment,
+                    'rx_errors': rx_errors,
+                    'tx_errors': tx_errors,
+                    'rx_drops': rx_drops,
+                    'tx_drops': tx_drops,
+                    'overflow': overflow,
                     'rx_mbps': rx_mbps,  # Use calculated rate
-                    'tx_mbps': tx_mbps   # Use calculated rate
+                    'tx_mbps': tx_mbps,   # Use calculated rate
+                    'error_rate': error_rate,
+                    'pause_frames': pause_rx + pause_tx,
+                    'queue_drops': queue_drops,
+                    'link_flaps': flap_count
                 })
         
         # Show ports with errors first
@@ -752,17 +886,64 @@ class MikroTikSFPCollector:
                 else:
                     errors_60s_str = f"{Fore.GREEN}    0{Style.RESET_ALL}"
                 
+                # Format error rate
+                if port['error_rate'] > 100:
+                    rate_str = f"{Fore.RED}{port['error_rate']:.0f} EPM{Style.RESET_ALL}"
+                elif port['error_rate'] > 10:
+                    rate_str = f"{Fore.YELLOW}{port['error_rate']:.0f} EPM{Style.RESET_ALL}"
+                elif port['error_rate'] > 0:
+                    rate_str = f"{Fore.GREEN}{port['error_rate']:.1f} EPM{Style.RESET_ALL}"
+                else:
+                    rate_str = f"{Fore.GREEN}0 EPM{Style.RESET_ALL}"
+                
+                # Build error details string with color coding
+                error_details = []
+                if port['fcs'] > 0:
+                    fcs_color = Fore.RED if port['fcs'] > 100 else Fore.YELLOW
+                    error_details.append(f"{fcs_color}FCS:{port['fcs']}{Style.RESET_ALL}")
+                if port['align'] > 0:
+                    align_color = Fore.RED if port['align'] > 50 else Fore.YELLOW
+                    error_details.append(f"{align_color}Align:{port['align']}{Style.RESET_ALL}")
+                if port['rx_drops'] > 0:
+                    drop_color = Fore.RED if port['rx_drops'] > 100 else Fore.YELLOW
+                    error_details.append(f"{drop_color}RX-Drop:{port['rx_drops']}{Style.RESET_ALL}")
+                if port['tx_drops'] > 0:
+                    drop_color = Fore.RED if port['tx_drops'] > 100 else Fore.YELLOW
+                    error_details.append(f"{drop_color}TX-Drop:{port['tx_drops']}{Style.RESET_ALL}")
+                if port['fragments'] > 0:
+                    frag_color = Fore.RED if port['fragments'] > 50 else Fore.YELLOW
+                    error_details.append(f"{frag_color}Frag:{port['fragments']}{Style.RESET_ALL}")
+                if port['overflow'] > 0:
+                    over_color = Fore.RED if port['overflow'] > 10 else Fore.YELLOW
+                    error_details.append(f"{over_color}Ovflw:{port['overflow']}{Style.RESET_ALL}")
+                
+                error_detail_str = ' | '.join(error_details) if error_details else f"{Fore.YELLOW}Mixed errors{Style.RESET_ALL}"
+                
                 print(f"{status_indicator} {color}{port['device']:20s} {port['port']:15s}{Style.RESET_ALL} | "
                       f"Total: {Fore.WHITE}{port['errors']:7d}{Style.RESET_ALL} | "
                       f"Last 10s: {errors_10s_str} | Last 60s: {errors_60s_str} | "
-                      f"FCS: {port['fcs']:5d}")
+                      f"Rate: {rate_str}")
+                print(f"    {Fore.CYAN}Error Breakdown:{Style.RESET_ALL} {error_detail_str}")
         
         # Show all ports status in compact format
         print(f"\n{Fore.GREEN}{Style.BRIGHT}[*] ALL PORTS STATUS:{Style.RESET_ALL}")
-        print(f"{Fore.GREEN}{'-'*110}{Style.RESET_ALL}")
-        header = f"{Fore.WHITE}{Style.BRIGHT}{'Device':20s} {'Port':15s} {'Status':10s} {'Traffic (Mbps)':16s} {'Rate':8s} {'Temp':6s} {'Power':12s} {'Errors':8s}{Style.RESET_ALL}"
+        print(f"{Fore.GREEN}{'-'*157}{Style.RESET_ALL}")
+        # Build header with proper spacing - adjusted to match data alignment
+        header = (f"{Fore.WHITE}{Style.BRIGHT}"
+                  f"{'Device':<20} "  
+                  f"{'Port':<15} "  
+                  f"{'Status':<10} "   
+                  f"{'Traffic(Mbps)':<16} " 
+                  f"{'Rate':<8} "     
+                  f"{'Temp':<5} "     
+                  f"{'Power(dBm)':<16} "  
+                  f"{'Errors':<9} "   # Increased from 6 to 9 (+3 spaces)
+                  f"{'FCS':<5} "     # Increased from 4 to 5 (+1 space)
+                  f"{'Q-Drop':<6} "  # Increased from 5 to 6 (+1 space)
+                  f"{'Flaps':<5}"    # Increased from 4 to 5 (+1 space)
+                  f"{Style.RESET_ALL}")
         print(header)
-        print(f"{Fore.WHITE}{'-'*110}{Style.RESET_ALL}")
+        print(f"{Fore.WHITE}{'-'*157}{Style.RESET_ALL}")
         
         # Sort ports by IP address first, then by port name
         def port_sort_key(port):
@@ -814,9 +995,16 @@ class MikroTikSFPCollector:
                 error_color = Fore.RED if port['errors'] > 100 else Fore.YELLOW
                 error_str = f"{error_color}{port['errors']}{Style.RESET_ALL}"
             else:
-                error_str = f"{Fore.GREEN}OK{Style.RESET_ALL}"
+                error_str = f"{Fore.GREEN}0{Style.RESET_ALL}"
             
-            # Color code temperature
+            # Show FCS errors separately
+            if port['fcs'] > 0:
+                fcs_color = Fore.RED if port['fcs'] > 50 else Fore.YELLOW if port['fcs'] > 10 else Fore.WHITE
+                fcs_str = f"{fcs_color}{port['fcs']}{Style.RESET_ALL}"
+            else:
+                fcs_str = f"{Fore.GREEN}0{Style.RESET_ALL}"
+            
+            # Color code temperature with fixed width
             temp_val = port['temp']
             if temp_val != 'N/A':
                 try:
@@ -827,16 +1015,58 @@ class MikroTikSFPCollector:
                         temp_color = Fore.YELLOW
                     else:
                         temp_color = Fore.GREEN
+                    # Format with fixed width for alignment - keep it simple
                     temp_str = f"{temp_color}{temp_val}C{Style.RESET_ALL}"
                 except:
                     temp_str = f"{temp_val}C"
             else:
                 temp_str = "N/A"
             
-            # Format power levels (truncate if too long)
-            rx_pwr = str(port['rx_power'])[:5] if port['rx_power'] != 'N/A' else 'N/A'
-            tx_pwr = str(port['tx_power'])[:5] if port['tx_power'] != 'N/A' else 'N/A'
-            power_str = f"{rx_pwr}/{tx_pwr}"
+            # Format power levels in dBm with color coding
+            rx_pwr = port['rx_power']
+            tx_pwr = port['tx_power']
+            
+            # Format and color code power levels
+            if rx_pwr != 'N/A' and tx_pwr != 'N/A':
+                try:
+                    # MikroTik usually provides power in dBm as string
+                    rx_val = float(str(rx_pwr).replace('dBm', ''))
+                    tx_val = float(str(tx_pwr).replace('dBm', ''))
+                    
+                    # Color code RX power to match legend
+                    if rx_val < -30:  # Very weak signal
+                        rx_color = Fore.RED
+                    elif rx_val >= -30 and rx_val < -20:  # Weak signal (-30 to -20)
+                        rx_color = Fore.YELLOW
+                    elif rx_val >= -20 and rx_val < -7:  # Good signal (-20 to -7)
+                        rx_color = Fore.GREEN
+                    elif rx_val >= -7 and rx_val < -3:  # Strong signal (-7 to -3)
+                        rx_color = Fore.CYAN
+                    else:  # Very strong (>= -3, might be too high)
+                        rx_color = Fore.MAGENTA
+                    
+                    # Color code TX power (typical range -10 to 3 dBm)
+                    if tx_val < -10:  # Very weak
+                        tx_color = Fore.RED
+                    elif tx_val < -5:  # Weak
+                        tx_color = Fore.YELLOW
+                    elif tx_val < 0:  # Good
+                        tx_color = Fore.GREEN
+                    else:  # Strong
+                        tx_color = Fore.CYAN
+                    
+                    # Format power with fixed width for alignment
+                    # Ensure both RX and TX use exactly 5 characters (e.g., "-12.5", " -3.4")
+                    rx_formatted = f"{rx_val:5.1f}"  # This ensures 5 chars total
+                    tx_formatted = f"{tx_val:5.1f}"  # This ensures 5 chars total
+                    rx_str = f"{rx_color}{rx_formatted}{Style.RESET_ALL}"
+                    tx_str = f"{tx_color}{tx_formatted}{Style.RESET_ALL}"
+                    power_str = f"{rx_str}/{tx_str}"  # Total visible width = 11 (5 + 1 + 5)
+                except:
+                    # If parsing fails, show raw values with fixed width
+                    power_str = f"{str(rx_pwr)[:6]:6}/{str(tx_pwr)[:6]:6}"
+            else:
+                power_str = f"{'N/A':^13}"
             
             # Color code rate
             if '10Gbps' in port['rate']:
@@ -846,20 +1076,100 @@ class MikroTikSFPCollector:
             else:
                 rate_color = Fore.WHITE
             
-            print(f"{Fore.WHITE}{port['device']:20s} {port['port']:15s}{Style.RESET_ALL} "
-                  f"{status_color}{status_text:10s}{Style.RESET_ALL} "
-                  f"{traffic_color}{traffic_str:16s}{Style.RESET_ALL} "
-                  f"{rate_color}{port['rate']:8s}{Style.RESET_ALL} "
-                  f"{temp_str:6s} {power_str:12s} {error_str:8s}")
+            # Format queue drops
+            if port['queue_drops'] > 100:
+                qdrop_str = f"{Fore.RED}{port['queue_drops']}{Style.RESET_ALL}"
+            elif port['queue_drops'] > 10:
+                qdrop_str = f"{Fore.YELLOW}{port['queue_drops']}{Style.RESET_ALL}"
+            elif port['queue_drops'] > 0:
+                qdrop_str = f"{Fore.WHITE}{port['queue_drops']}{Style.RESET_ALL}"
+            else:
+                qdrop_str = f"{Fore.GREEN}0{Style.RESET_ALL}"
+            
+            # Format link flaps
+            if port['link_flaps'] > 5:
+                flap_str = f"{Fore.RED}{port['link_flaps']}{Style.RESET_ALL}"
+            elif port['link_flaps'] > 0:
+                flap_str = f"{Fore.YELLOW}{port['link_flaps']}{Style.RESET_ALL}"
+            else:
+                flap_str = f"{Fore.GREEN}0{Style.RESET_ALL}"
+            
+            # Build formatted row with proper alignment
+            # The strings already contain color codes, so just print with spaces
+            # Adjust spacing to move errors and following columns to the right
+            print(f"{Fore.WHITE}{port['device']:<20}{Style.RESET_ALL} "
+                  f"{Fore.WHITE}{port['port']:<15}{Style.RESET_ALL} "
+                  f"{status_color}{status_text:<10}{Style.RESET_ALL} "
+                  f"{traffic_color}{traffic_str:<16}{Style.RESET_ALL} "
+                  f"{rate_color}{port['rate']:<8}{Style.RESET_ALL} "
+                  f"{temp_str}   "  # Add 3 spaces after temp
+                  f"{power_str}     "  # Add 5 spaces after power (was 2, now 5 = +3 to right)
+                  f"{error_str}      "  # Keep 6 spaces
+                  f"{fcs_str}    "  # Keep 4 spaces
+                  f"{qdrop_str}     "  # Keep 5 spaces
+                  f"{flap_str}")
         
-        # Show traffic legend
-        print(f"\n{Fore.CYAN}{Style.BRIGHT}[*] TRAFFIC LEGEND (RX/TX Mbps):{Style.RESET_ALL}")
-        print(f"  {Fore.BLUE}■ 0 Mbps (Idle){Style.RESET_ALL} | "
-              f"{Fore.GREEN}■ 10+ Mbps{Style.RESET_ALL} | "
-              f"{Fore.CYAN}■ 100+ Mbps{Style.RESET_ALL} | "
-              f"{Fore.YELLOW}■ 1+ Gbps{Style.RESET_ALL} | "
-              f"{Fore.MAGENTA}■ 5+ Gbps{Style.RESET_ALL} | "
-              f"{Fore.RED}■ 8+ Gbps (Heavy){Style.RESET_ALL}")
+        # Show packet size distribution for ports with traffic
+        active_ports = [p for p in all_ports if p['rx_mbps'] + p['tx_mbps'] > 10]  # Only ports with >10Mbps
+        if active_ports and len(active_ports) <= 3:  # Show for up to 3 active ports
+            print(f"\n{Fore.BLUE}{Style.BRIGHT}[*] PACKET SIZE DISTRIBUTION:{Style.RESET_ALL}")
+            for port in active_ports[:3]:
+                dist = self.get_packet_size_distribution(port['ip'], port['port'])
+                if dist:
+                    print(f"  {port['device']} {port['port']}:", end="")
+                    for size, percent in dist.items():
+                        if percent > 1:  # Only show sizes with >1%
+                            color = Fore.YELLOW if percent > 50 else Fore.CYAN if percent > 20 else Fore.WHITE
+                            print(f" {color}{size}:{percent:.0f}%{Style.RESET_ALL}", end="")
+                    print()
+        
+        # Show ports with pause frames
+        pause_ports = [p for p in all_ports if p['pause_frames'] > 0]
+        if pause_ports:
+            print(f"\n{Fore.YELLOW}{Style.BRIGHT}[!] FLOW CONTROL ACTIVE (Pause Frames):{Style.RESET_ALL}")
+            for port in pause_ports[:5]:  # Show up to 5 ports
+                print(f"  {port['device']:20s} {port['port']:15s} - {port['pause_frames']} frames")
+        
+        # Show detailed error breakdown for ports with significant errors
+        significant_error_ports = [p for p in all_ports if p['errors'] > 10]
+        if significant_error_ports:
+            print(f"\n{Fore.YELLOW}{Style.BRIGHT}[!] ERROR DETAILS:{Style.RESET_ALL}")
+            for port in significant_error_ports[:5]:  # Show up to 5 ports
+                error_types = []
+                if port['fcs'] > 0:
+                    error_types.append(f"FCS: {port['fcs']}")
+                if port['align'] > 0:
+                    error_types.append(f"Alignment: {port['align']}")
+                if port['rx_drops'] > 0:
+                    error_types.append(f"RX-Drops: {port['rx_drops']}")
+                if port['tx_drops'] > 0:
+                    error_types.append(f"TX-Drops: {port['tx_drops']}")
+                if port['fragments'] > 0:
+                    error_types.append(f"Fragments: {port['fragments']}")
+                if port['overflow'] > 0:
+                    error_types.append(f"Overflow: {port['overflow']}")
+                
+                print(f"  {port['device']:20s} {port['port']:15s} - {', '.join(error_types)}")
+        
+        # Show legend
+        print(f"\n{Fore.CYAN}{Style.BRIGHT}[*] LEGEND:{Style.RESET_ALL}")
+        print(f"  Traffic (RX/TX Mbps): {Fore.BLUE}* Idle{Style.RESET_ALL} | "
+              f"{Fore.GREEN}* 10+{Style.RESET_ALL} | "
+              f"{Fore.CYAN}* 100+{Style.RESET_ALL} | "
+              f"{Fore.YELLOW}* 1G+{Style.RESET_ALL} | "
+              f"{Fore.MAGENTA}* 5G+{Style.RESET_ALL} | "
+              f"{Fore.RED}* 8G+{Style.RESET_ALL}")
+        print(f"  Power RX (dBm): {Fore.RED}* <-30 (Very Weak){Style.RESET_ALL} | "
+              f"{Fore.YELLOW}* -30 to -20 (Weak){Style.RESET_ALL} | "
+              f"{Fore.GREEN}* -20 to -7 (Good){Style.RESET_ALL} | "
+              f"{Fore.CYAN}* -7 to -3 (Strong){Style.RESET_ALL} | "
+              f"{Fore.MAGENTA}* >-3 (Very Strong){Style.RESET_ALL}")
+        print(f"  Power TX (dBm): {Fore.RED}* <-10 (Very Weak){Style.RESET_ALL} | "
+              f"{Fore.YELLOW}* -10 to -5 (Weak){Style.RESET_ALL} | "
+              f"{Fore.GREEN}* -5 to 0 (Good){Style.RESET_ALL} | "
+              f"{Fore.CYAN}* >0 (Strong){Style.RESET_ALL}")
+        print(f"  Error Types: FCS = Frame Check Sequence | Q-Drop = Queue Drops | Flaps = Link State Changes")
+        print(f"  EPM = Errors Per Million packets | Align = Alignment Errors | Frag = Fragmented Packets")
         
         print(f"\n{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
         print(f"{Fore.YELLOW}Press 'R' to reset counters | Ctrl+C to stop monitoring{Style.RESET_ALL}")
@@ -1030,6 +1340,10 @@ def main():
     parser.add_argument('-w', '--workers', type=int, default=5, 
                        help='Maximum concurrent connections (default: 5)')
     parser.add_argument('--interval', type=int, default=1, help='Refresh interval in seconds (default: 1)')
+    parser.add_argument('-c', '--config', type=str, default='mikrotik_hosts.txt',
+                       help='Path to hosts configuration file (default: mikrotik_hosts.txt)')
+    parser.add_argument('--no-discovery', action='store_true',
+                       help='Disable MNDP discovery and only use config file')
     
     args = parser.parse_args()
     
@@ -1047,11 +1361,25 @@ def main():
     print(f"Refresh interval: {args.interval} second(s)")
     print("Press 'R' to reset counters, Ctrl+C to stop...\n")
     
+    # Load hosts from config file first
+    print(f"Loading hosts from configuration file: {args.config}")
+    config_hosts = collector.load_hosts_from_file(args.config)
+    
     # Shared list of discovered hosts (thread-safe)
-    discovered_hosts = set()
+    discovered_hosts = set(config_hosts)  # Initialize with config hosts
     hosts_lock = threading.Lock()
     
-    # Discovery thread - continuously discovers devices
+    if config_hosts:
+        print(f"  Loaded {len(config_hosts)} host(s) from config file")
+    
+    if args.no_discovery:
+        print("  MNDP discovery disabled - using only config file hosts")
+    elif not config_hosts:
+        print("  No hosts found in config file, relying on MNDP discovery")
+    else:
+        print("  Will also use MNDP discovery to find additional devices")
+    
+    # Discovery thread - continuously discovers devices (skip if disabled)
     def continuous_discovery():
         discovery_count = 0
         while True:
@@ -1076,20 +1404,22 @@ def main():
             except:
                 time.sleep(5)
     
-    discovery_thread = threading.Thread(target=continuous_discovery, daemon=True)
-    discovery_thread.start()
-    
-    # Initial discovery with longer timeout - do it twice for better coverage
-    print("Performing initial device discovery (this may take up to 30 seconds)...")
-    for attempt in range(2):
-        devices = collector.discover_mikrotik_devices(timeout=10)
-        if devices:
-            for device in devices:
-                if device['ip'] not in discovered_hosts:
-                    discovered_hosts.add(device['ip'])
-                    print(f"  - {device['identity']} ({device['ip']}")
-        if attempt == 0:
-            time.sleep(2)  # Short pause between attempts
+    # Start discovery thread only if not disabled
+    if not args.no_discovery:
+        discovery_thread = threading.Thread(target=continuous_discovery, daemon=True)
+        discovery_thread.start()
+        
+        # Initial discovery with longer timeout - do it twice for better coverage
+        print("Performing initial device discovery (this may take up to 30 seconds)...")
+        for attempt in range(2):
+            devices = collector.discover_mikrotik_devices(timeout=10)
+            if devices:
+                for device in devices:
+                    if device['ip'] not in discovered_hosts:
+                        discovered_hosts.add(device['ip'])
+                        print(f"  - {device['identity']} ({device['ip']}")
+            if attempt == 0:
+                time.sleep(2)  # Short pause between attempts
     
     # Start monitoring even if no devices initially found
     if True:  # Always start monitoring

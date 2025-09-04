@@ -33,15 +33,19 @@ cd mikrotik-sfp-monitor
 pip install -r requirements.txt
 ```
 
-3. Configure your MikroTik hosts (optional):
+3. Configure your MikroTik hosts (optional but recommended):
 Create or edit `mikrotik_hosts.txt`:
 ```
 # MikroTik hosts configuration file
 # Add one IP address per line
+# Lines starting with # are comments
 10.77.8.1
 10.77.9.3
 10.77.9.4
+192.168.1.1
 ```
+
+The tool will use both the configuration file and MNDP discovery by default.
 
 ## Usage
 
@@ -56,7 +60,17 @@ python mikrotik_sfp_stats.py -u admin -p "your_password"
 
 Start real-time monitoring with 1-second refresh:
 ```bash
-python mikrotik_sfp_stats.py -u admin -p "your_password" -m
+python mikrotik_sfp_stats.py -u admin -p "your_password"
+```
+
+Monitor only devices from config file (no discovery):
+```bash
+python mikrotik_sfp_stats.py -u admin -p "your_password" --no-discovery
+```
+
+Use custom config file:
+```bash
+python mikrotik_sfp_stats.py -u admin -p "your_password" -c my_routers.txt
 ```
 
 In monitoring mode:
@@ -79,12 +93,11 @@ python mikrotik_sfp_stats.py -u admin -p "your_password" -o csv > stats.csv
 
 - `-u, --username`: RouterOS username (required)
 - `-p, --password`: RouterOS password (required)
-- `-o, --output`: Output format (table/json/csv, default: table)
-- `-m, --monitor`: Enable continuous monitoring mode
+- `-c, --config`: Path to hosts configuration file (default: mikrotik_hosts.txt)
+- `--no-discovery`: Disable MNDP discovery and only use config file
+- `-w, --workers`: Maximum concurrent connections (default: 5)
+- `--interval`: Refresh interval in seconds for monitoring (default: 1)
 - `--port`: RouterOS API port (default: 8728)
-- `--ssh-port`: SSH port for fallback (default: 22)
-- `--use-ssh`: Use SSH instead of API
-- `-q, --quiet`: Suppress verbose output
 
 ## Features in Detail
 
