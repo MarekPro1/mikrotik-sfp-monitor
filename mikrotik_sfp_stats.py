@@ -806,9 +806,14 @@ class MikroTikSFPCollector:
                 # Get queue drops
                 queue_drops = self.get_delta_value(device_ip, port_name, 'tx_queue_drop', sfp.get('tx_queue_drop', 0))
                 
-                # Get link flap info
+                # Get link flap/down info
                 link_info = self.link_state_history.get(key, {})
                 flap_count = link_info.get('flap_count', 0)
+                link_downs = self.get_delta_value(device_ip, port_name, 'link_downs', sfp.get('link_downs', 0))
+                total_link_downs = sfp.get('link_downs', 0)  # Total count since boot
+                
+                # Track if port is currently down
+                is_down = sfp.get('status', 'unknown') not in ['link-ok', 'running']
                 
                 all_ports.append({
                     'device': device['hostname'],
@@ -833,10 +838,22 @@ class MikroTikSFPCollector:
                     'error_rate': error_rate,
                     'pause_frames': pause_rx + pause_tx,
                     'queue_drops': queue_drops,
-                    'link_flaps': flap_count
+                    'link_flaps': flap_count,
+                    'link_downs': link_downs,
+                    'total_link_downs': total_link_downs,
+                    'is_down': is_down
                 })
         
-        # Show ports with errors first
+        # Show ports with link issues
+        down_ports = [p for p in all_ports if p['is_down']]
+        if down_ports:
+            print(f"\n{Fore.RED}{Style.BRIGHT}[!] PORTS CURRENTLY DOWN:{Style.RESET_ALL}")
+            print(f"{Fore.RED}{'-'*80}{Style.RESET_ALL}")
+            for port in down_ports:
+                print(f"{Fore.RED}[DOWN]{Style.RESET_ALL} {port['device']:20s} {port['port']:15s} - "
+                      f"Total downs: {port['total_link_downs']}")
+        
+        # Show ports with errors
         error_ports = [p for p in all_ports if p['errors'] > 0]
         if error_ports:
             print(f"\n{Fore.RED}{Style.BRIGHT}[!] PORTS WITH ERRORS:{Style.RESET_ALL}")
@@ -927,7 +944,7 @@ class MikroTikSFPCollector:
         
         # Show all ports status in compact format
         print(f"\n{Fore.GREEN}{Style.BRIGHT}[*] ALL PORTS STATUS:{Style.RESET_ALL}")
-        print(f"{Fore.GREEN}{'-'*157}{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}{'-'*165}{Style.RESET_ALL}")
         # Build header with proper spacing - adjusted to match data alignment
         header = (f"{Fore.WHITE}{Style.BRIGHT}"
                   f"{'Device':<20} "  
@@ -937,13 +954,14 @@ class MikroTikSFPCollector:
                   f"{'Rate':<8} "     
                   f"{'Temp':<5} "     
                   f"{'Power(dBm)':<16} "  
-                  f"{'Errors':<9} "   # Increased from 6 to 9 (+3 spaces)
-                  f"{'FCS':<5} "     # Increased from 4 to 5 (+1 space)
-                  f"{'Q-Drop':<6} "  # Increased from 5 to 6 (+1 space)
-                  f"{'Flaps':<5}"    # Increased from 4 to 5 (+1 space)
+                  f"{'Errors':<9} "   
+                  f"{'FCS':<5} "     
+                  f"{'Q-Drop':<6} "  
+                  f"{'L-Down':<7} "  # Link Downs
+                  f"{'Flaps':<5}"    
                   f"{Style.RESET_ALL}")
         print(header)
-        print(f"{Fore.WHITE}{'-'*157}{Style.RESET_ALL}")
+        print(f"{Fore.WHITE}{'-'*165}{Style.RESET_ALL}")
         
         # Sort ports by IP address first, then by port name
         def port_sort_key(port):
@@ -1086,6 +1104,16 @@ class MikroTikSFPCollector:
             else:
                 qdrop_str = f"{Fore.GREEN}0{Style.RESET_ALL}"
             
+            # Format link downs
+            if port['link_downs'] > 10:
+                ldown_str = f"{Fore.RED}{port['link_downs']}{Style.RESET_ALL}"
+            elif port['link_downs'] > 5:
+                ldown_str = f"{Fore.YELLOW}{port['link_downs']}{Style.RESET_ALL}"
+            elif port['link_downs'] > 0:
+                ldown_str = f"{Fore.WHITE}{port['link_downs']}{Style.RESET_ALL}"
+            else:
+                ldown_str = f"{Fore.GREEN}0{Style.RESET_ALL}"
+            
             # Format link flaps
             if port['link_flaps'] > 5:
                 flap_str = f"{Fore.RED}{port['link_flaps']}{Style.RESET_ALL}"
@@ -1103,11 +1131,26 @@ class MikroTikSFPCollector:
                   f"{traffic_color}{traffic_str:<16}{Style.RESET_ALL} "
                   f"{rate_color}{port['rate']:<8}{Style.RESET_ALL} "
                   f"{temp_str}   "  # Add 3 spaces after temp
-                  f"{power_str}     "  # Add 5 spaces after power (was 2, now 5 = +3 to right)
+                  f"{power_str}     "  # Add 5 spaces after power
                   f"{error_str}      "  # Keep 6 spaces
                   f"{fcs_str}    "  # Keep 4 spaces
                   f"{qdrop_str}     "  # Keep 5 spaces
+                  f"{ldown_str}       "  # Add 7 spaces for link downs
                   f"{flap_str}")
+        
+        # Show ports with frequent link downs
+        unstable_ports = [p for p in all_ports if p['link_downs'] > 0 or p['link_flaps'] > 0]
+        if unstable_ports:
+            print(f"\n{Fore.YELLOW}{Style.BRIGHT}[!] LINK STABILITY ISSUES:{Style.RESET_ALL}")
+            for port in sorted(unstable_ports, key=lambda x: x['link_downs'] + x['link_flaps'], reverse=True)[:5]:
+                stability_info = []
+                if port['link_downs'] > 0:
+                    stability_info.append(f"Link Downs: {port['link_downs']}")
+                if port['link_flaps'] > 0:
+                    stability_info.append(f"Flaps: {port['link_flaps']}")
+                if port['total_link_downs'] > 0:
+                    stability_info.append(f"Total Downs Since Boot: {port['total_link_downs']}")
+                print(f"  {port['device']:20s} {port['port']:15s} - {', '.join(stability_info)}")
         
         # Show packet size distribution for ports with traffic
         active_ports = [p for p in all_ports if p['rx_mbps'] + p['tx_mbps'] > 10]  # Only ports with >10Mbps
@@ -1168,7 +1211,7 @@ class MikroTikSFPCollector:
               f"{Fore.YELLOW}* -10 to -5 (Weak){Style.RESET_ALL} | "
               f"{Fore.GREEN}* -5 to 0 (Good){Style.RESET_ALL} | "
               f"{Fore.CYAN}* >0 (Strong){Style.RESET_ALL}")
-        print(f"  Error Types: FCS = Frame Check Sequence | Q-Drop = Queue Drops | Flaps = Link State Changes")
+        print(f"  Error Types: FCS = Frame Check Sequence | Q-Drop = Queue Drops | L-Down = Link Down Events | Flaps = Link State Changes")
         print(f"  EPM = Errors Per Million packets | Align = Alignment Errors | Frag = Fragmented Packets")
         
         print(f"\n{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
