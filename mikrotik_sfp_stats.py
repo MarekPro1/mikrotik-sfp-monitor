@@ -8,14 +8,14 @@ import sys
 import json
 import argparse
 import ipaddress
-import struct
+# import struct  # Not needed without discovery
 import time
 import os
 import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Optional, Tuple
-import socket
+# import socket  # Not needed without discovery
 
 # Platform-specific imports
 if os.name == 'nt':
@@ -93,114 +93,7 @@ class MikroTikSFPCollector:
                 print(f"  Error reading config file: {e}")
         return hosts
     
-    def discover_mikrotik_devices(self, timeout: float = 15.0) -> List[Dict]:
-        """Discover MikroTik devices using MNDP (MikroTik Neighbor Discovery Protocol)"""
-        print("Discovering MikroTik devices using MNDP protocol...")
-        devices = []
-        
-        # MNDP uses UDP port 5678
-        MNDP_PORT = 5678
-        MNDP_MULTICAST = '255.255.255.255'
-        
-        try:
-            # Create UDP socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.settimeout(2.0)  # Increased timeout
-            
-            # Try to bind to MNDP port
-            try:
-                sock.bind(('', MNDP_PORT))
-            except OSError:
-                # Port might be in use, try another port
-                sock.bind(('', 0))
-                print("  Note: Could not bind to MNDP port 5678, using alternative port")
-            
-            # Send multiple discovery packets to ensure all devices respond
-            # Send in bursts for better coverage
-            for burst in range(3):  # 3 bursts
-                for i in range(5):  # 5 packets per burst
-                    discovery_packet = b'\x00\x00\x00\x00'
-                    sock.sendto(discovery_packet, (MNDP_MULTICAST, MNDP_PORT))
-                    time.sleep(0.05)  # Very fast within burst
-                time.sleep(0.3)  # Pause between bursts
-            
-            # Collect responses
-            start_time = time.time()
-            seen_devices = set()
-            
-            while time.time() - start_time < timeout:
-                try:
-                    data, addr = sock.recvfrom(1500)
-                    if addr[0] not in seen_devices and len(data) > 20:
-                        # Basic MNDP packet parsing
-                        device_info = self._parse_mndp_packet(data, addr[0])
-                        if device_info:
-                            devices.append(device_info)
-                            seen_devices.add(addr[0])
-                            # Don't print during continuous discovery
-                except socket.timeout:
-                    continue
-                except Exception as e:
-                    continue
-            
-            sock.close()
-            
-        except Exception as e:
-            print(f"MNDP discovery warning: {e}")
-        
-        return devices
-    
-    def _parse_mndp_packet(self, data: bytes, ip: str) -> Optional[Dict]:
-        """Parse MNDP packet to extract device information"""
-        try:
-            # MNDP packets contain TLV (Type-Length-Value) fields
-            device = {'ip': ip, 'identity': 'Unknown', 'version': '', 'platform': ''}
-            
-            offset = 0
-            while offset < len(data) - 4:
-                if offset + 4 > len(data):
-                    break
-                    
-                # Read TLV header
-                tlv_type = struct.unpack('>H', data[offset:offset+2])[0]
-                tlv_length = struct.unpack('>H', data[offset+2:offset+4])[0]
-                
-                if offset + 4 + tlv_length > len(data):
-                    break
-                
-                tlv_value = data[offset+4:offset+4+tlv_length]
-                
-                # Parse known TLV types
-                if tlv_type == 0x0001:  # MAC address
-                    if len(tlv_value) == 6:
-                        device['mac'] = ':'.join(f'{b:02x}' for b in tlv_value)
-                elif tlv_type == 0x0005:  # Identity
-                    device['identity'] = tlv_value.decode('utf-8', errors='ignore').strip('\x00')
-                elif tlv_type == 0x0007:  # Version
-                    device['version'] = tlv_value.decode('utf-8', errors='ignore').strip('\x00')
-                elif tlv_type == 0x0008:  # Platform
-                    device['platform'] = tlv_value.decode('utf-8', errors='ignore').strip('\x00')
-                elif tlv_type == 0x000a:  # Uptime
-                    if len(tlv_value) == 4:
-                        device['uptime'] = struct.unpack('>I', tlv_value)[0]
-                elif tlv_type == 0x000b:  # Software ID
-                    device['software_id'] = tlv_value.decode('utf-8', errors='ignore').strip('\x00')
-                elif tlv_type == 0x000c:  # Board
-                    device['board'] = tlv_value.decode('utf-8', errors='ignore').strip('\x00')
-                elif tlv_type == 0x0010:  # IPv6 address
-                    if len(tlv_value) == 16:
-                        device['ipv6'] = ':'.join(f'{struct.unpack(">H", tlv_value[i:i+2])[0]:04x}' 
-                                                 for i in range(0, 16, 2))
-                
-                offset += 4 + tlv_length
-            
-            return device if device['identity'] != 'Unknown' else None
-            
-        except Exception as e:
-            return None
-    
+    # Discovery functionality removed - using config file only for faster startup
     
     def get_sfp_stats_api(self, host: str) -> Dict:
         """Get SFP statistics using RouterOS API"""
@@ -292,8 +185,8 @@ class MikroTikSFPCollector:
                             if sfp_present == 'true' or sfp_present == True or sfp_present == 'yes':
                                 has_sfp = True
                             
-                            if has_sfp:
-                                sfp_info = {
+                            # Collect info for ALL ethernet ports, not just those with SFP
+                            port_info = {
                                     'interface': if_name,
                                     'status': mon.get('status', 'unknown'),
                                     'sfp_vendor': mon.get('sfp-vendor-name', 'N/A'),
@@ -304,28 +197,28 @@ class MikroTikSFPCollector:
                                     'sfp_tx_power': mon.get('sfp-tx-power', 'N/A'),
                                     'rate': mon.get('rate', 'N/A'),
                                     'full_duplex': mon.get('full-duplex', 'false') == 'true'
-                                }
-                                
-                                # Get comprehensive interface statistics
-                                stats_query = api('/interface/print')
-                                stats_list = list(stats_query)
-                                
-                                # Get ethernet stats for more detailed error information
-                                eth_stats = list(api('/interface/ethernet/print'))
-                                
-                                # Get system resource info for enhanced monitoring
-                                queue_stats = []
-                                try:
-                                    # Try to get queue statistics
-                                    queue_query = api('/queue/simple/print')
-                                    queue_stats = list(queue_query)
-                                except:
-                                    pass
-                                
-                                # Find statistics for this specific interface
-                                for st in stats_list:
-                                    if st.get('name') == if_name:
-                                        sfp_info.update({
+                            }
+                            
+                            # Get comprehensive interface statistics
+                            stats_query = api('/interface/print')
+                            stats_list = list(stats_query)
+                            
+                            # Get ethernet stats for more detailed error information
+                            eth_stats = list(api('/interface/ethernet/print'))
+                            
+                            # Get system resource info for enhanced monitoring
+                            queue_stats = []
+                            try:
+                                # Try to get queue statistics
+                                queue_query = api('/queue/simple/print')
+                                queue_stats = list(queue_query)
+                            except:
+                                pass
+                            
+                            # Find statistics for this specific interface
+                            for st in stats_list:
+                                if st.get('name') == if_name:
+                                    port_info.update({
                                             'rx_bytes': int(st.get('rx-byte', 0)),
                                             'rx_packets': int(st.get('rx-packet', 0)),
                                             'tx_bytes': int(st.get('tx-byte', 0)),
@@ -334,13 +227,13 @@ class MikroTikSFPCollector:
                                             'tx_errors': int(st.get('tx-error', 0)),
                                             'rx_drops': int(st.get('rx-drop', 0)),
                                             'tx_drops': int(st.get('tx-drop', 0))
-                                        })
-                                        break
-                                
-                                # Get detailed ethernet error statistics
-                                for eth in eth_stats:
-                                    if eth.get('name') == if_name:
-                                        sfp_info.update({
+                                    })
+                                    break
+                            
+                            # Get detailed ethernet error statistics
+                            for eth in eth_stats:
+                                if eth.get('name') == if_name:
+                                    port_info.update({
                                             'rx_fcs_error': int(eth.get('rx-fcs-error', 0)),
                                             'rx_align_error': int(eth.get('rx-align-error', 0)),
                                             'rx_fragment': int(eth.get('rx-fragment', 0)),
@@ -361,54 +254,60 @@ class MikroTikSFPCollector:
                                             'tx_pause': int(eth.get('tx-pause', 0)),
                                             'tx_queue_drop': int(eth.get('tx-queue-drop', 0)),
                                             'link_downs': int(eth.get('link-downs', 0))
-                                        })
-                                        
-                                        # Store packet size distribution
-                                        key = f"{host}_{if_name}"
-                                        self.packet_size_dist[key] = {
-                                            '64': sfp_info.get('rx_64', 0),
-                                            '65-127': sfp_info.get('rx_65_127', 0),
-                                            '128-255': sfp_info.get('rx_128_255', 0),
-                                            '256-511': sfp_info.get('rx_256_511', 0),
-                                            '512-1023': sfp_info.get('rx_512_1023', 0),
-                                            '1024-1518': sfp_info.get('rx_1024_1518', 0),
-                                            '1519+': sfp_info.get('rx_1519_max', 0)
+                                    })
+                                    
+                                    # Store packet size distribution
+                                    key = f"{host}_{if_name}"
+                                    self.packet_size_dist[key] = {
+                                        '64': port_info.get('rx_64', 0),
+                                        '65-127': port_info.get('rx_65_127', 0),
+                                        '128-255': port_info.get('rx_128_255', 0),
+                                        '256-511': port_info.get('rx_256_511', 0),
+                                        '512-1023': port_info.get('rx_512_1023', 0),
+                                        '1024-1518': port_info.get('rx_1024_1518', 0),
+                                        '1519+': port_info.get('rx_1519_max', 0)
+                                    }
+                                    
+                                    # Store pause frame info
+                                    self.pause_frames[key] = {
+                                        'rx': port_info.get('rx_pause', 0),
+                                        'tx': port_info.get('tx_pause', 0)
+                                    }
+                                    
+                                    # Track link state changes
+                                    if key not in self.link_state_history:
+                                        self.link_state_history[key] = {
+                                            'link_downs': port_info.get('link_downs', 0),
+                                            'last_state': port_info.get('status', 'unknown'),
+                                            'flap_count': 0,
+                                            'last_change': time.time()
                                         }
-                                        
-                                        # Store pause frame info
-                                        self.pause_frames[key] = {
-                                            'rx': sfp_info.get('rx_pause', 0),
-                                            'tx': sfp_info.get('tx_pause', 0)
-                                        }
-                                        
-                                        # Track link state changes
-                                        if key not in self.link_state_history:
-                                            self.link_state_history[key] = {
-                                                'link_downs': sfp_info.get('link_downs', 0),
-                                                'last_state': sfp_info.get('status', 'unknown'),
-                                                'flap_count': 0,
-                                                'last_change': time.time()
-                                            }
-                                        else:
-                                            current_downs = sfp_info.get('link_downs', 0)
-                                            if current_downs > self.link_state_history[key]['link_downs']:
-                                                self.link_state_history[key]['flap_count'] += 1
-                                                self.link_state_history[key]['link_downs'] = current_downs
-                                                self.link_state_history[key]['last_change'] = time.time()
-                                        
-                                        break
-                                
-                                # Track queue drops if available
-                                for q in queue_stats:
-                                    if q.get('target') and if_name in q.get('target', ''):
-                                        key = f"{host}_{if_name}"
-                                        self.queue_drops[key] = {
-                                            'drops': int(q.get('drops', 0)),
-                                            'queued': int(q.get('queued-packets', 0))
-                                        }
-                                        break
-                                
-                                stats['sfp_ports'].append(sfp_info)
+                                    else:
+                                        current_downs = port_info.get('link_downs', 0)
+                                        if current_downs > self.link_state_history[key]['link_downs']:
+                                            self.link_state_history[key]['flap_count'] += 1
+                                            self.link_state_history[key]['link_downs'] = current_downs
+                                            self.link_state_history[key]['last_change'] = time.time()
+                                    
+                                    break
+                            
+                            # Track queue drops if available
+                            for q in queue_stats:
+                                if q.get('target') and if_name in q.get('target', ''):
+                                    key = f"{host}_{if_name}"
+                                    self.queue_drops[key] = {
+                                        'drops': int(q.get('drops', 0)),
+                                        'queued': int(q.get('queued-packets', 0))
+                                    }
+                                    break
+                            
+                            # Add to appropriate list based on whether it has SFP
+                            if has_sfp:
+                                port_info['has_sfp'] = True
+                                stats['sfp_ports'].append(port_info)
+                            else:
+                                port_info['has_sfp'] = False
+                                stats['ethernet_ports'].append(port_info)
                     except (TrapError, FatalError) as e:
                         # Interface might not support monitoring
                         continue
@@ -720,7 +619,7 @@ class MikroTikSFPCollector:
         # Header with timestamp
         output_lines.append(f"{Fore.CYAN}{Style.BRIGHT}{'='*80}{Style.RESET_ALL}")
         output_lines.append(f"{Fore.CYAN}{Style.BRIGHT}MIKROTIK SFP MONITORING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{Style.RESET_ALL}")
-        output_lines.append(f"{Fore.YELLOW}Monitoring {device_count} device(s) - Discovery running in background{Style.RESET_ALL}")
+        output_lines.append(f"{Fore.YELLOW}Monitoring {device_count} device(s) from config file{Style.RESET_ALL}")
         if self.reset_time:
             elapsed = (datetime.now() - self.reset_time).total_seconds()
             output_lines.append(f"{Fore.GREEN}Counters reset {int(elapsed)} seconds ago - showing delta values{Style.RESET_ALL}")
@@ -762,32 +661,41 @@ class MikroTikSFPCollector:
                   f"Model: {Fore.CYAN}{model:15s}{Fore.WHITE} | "
                   f"CPU: {cpu_color}{cpu:3d}%{Style.RESET_ALL}")
         
-        # Collect all ports with their status
+        # Collect all ports with their status (both SFP and regular ethernet)
         all_ports = []
         for device in self.results:
             if device['error']:
                 continue
+            # Process both SFP ports and regular ethernet ports
+            all_device_ports = []
             for sfp in device['sfp_ports']:
+                sfp['is_sfp'] = True
+                all_device_ports.append(sfp)
+            for eth in device.get('ethernet_ports', []):
+                eth['is_sfp'] = False
+                all_device_ports.append(eth)
+            
+            for port in all_device_ports:
                 # Get device and port info
                 device_ip = device['host']
-                port_name = sfp['interface']
+                port_name = port['interface']
                 
                 # Calculate actual traffic rate in Mbps/s
                 rx_mbps, tx_mbps = self.get_traffic_rate(
                     device_ip, port_name,
-                    sfp.get('rx_bytes', 0),
-                    sfp.get('tx_bytes', 0)
+                    port.get('rx_bytes', 0),
+                    port.get('tx_bytes', 0)
                 )
                 
                 # Calculate delta values for all error types
-                rx_errors = self.get_delta_value(device_ip, port_name, 'rx_errors', sfp.get('rx_errors', 0))
-                tx_errors = self.get_delta_value(device_ip, port_name, 'tx_errors', sfp.get('tx_errors', 0))
-                rx_drops = self.get_delta_value(device_ip, port_name, 'rx_drops', sfp.get('rx_drops', 0))
-                tx_drops = self.get_delta_value(device_ip, port_name, 'tx_drops', sfp.get('tx_drops', 0))
-                fcs_errors = self.get_delta_value(device_ip, port_name, 'rx_fcs_error', sfp.get('rx_fcs_error', 0))
-                align_errors = self.get_delta_value(device_ip, port_name, 'rx_align_error', sfp.get('rx_align_error', 0))
-                fragment = self.get_delta_value(device_ip, port_name, 'rx_fragment', sfp.get('rx_fragment', 0))
-                overflow = self.get_delta_value(device_ip, port_name, 'rx_overflow', sfp.get('rx_overflow', 0))
+                rx_errors = self.get_delta_value(device_ip, port_name, 'rx_errors', port.get('rx_errors', 0))
+                tx_errors = self.get_delta_value(device_ip, port_name, 'tx_errors', port.get('tx_errors', 0))
+                rx_drops = self.get_delta_value(device_ip, port_name, 'rx_drops', port.get('rx_drops', 0))
+                tx_drops = self.get_delta_value(device_ip, port_name, 'tx_drops', port.get('tx_drops', 0))
+                fcs_errors = self.get_delta_value(device_ip, port_name, 'rx_fcs_error', port.get('rx_fcs_error', 0))
+                align_errors = self.get_delta_value(device_ip, port_name, 'rx_align_error', port.get('rx_align_error', 0))
+                fragment = self.get_delta_value(device_ip, port_name, 'rx_fragment', port.get('rx_fragment', 0))
+                overflow = self.get_delta_value(device_ip, port_name, 'rx_overflow', port.get('rx_overflow', 0))
                 
                 # Count total errors (using delta values)
                 total_errors = (
@@ -796,8 +704,8 @@ class MikroTikSFPCollector:
                 )
                 
                 # Calculate error rate per million packets
-                total_packets = self.get_delta_value(device_ip, port_name, 'rx_packets', sfp.get('rx_packets', 0)) + \
-                                self.get_delta_value(device_ip, port_name, 'tx_packets', sfp.get('tx_packets', 0))
+                total_packets = self.get_delta_value(device_ip, port_name, 'rx_packets', port.get('rx_packets', 0)) + \
+                                self.get_delta_value(device_ip, port_name, 'tx_packets', port.get('tx_packets', 0))
                 error_rate = self.calculate_error_rate(device_ip, port_name, total_errors, total_packets)
                 
                 # Get pause frame counts
@@ -806,26 +714,31 @@ class MikroTikSFPCollector:
                 pause_tx = self.pause_frames.get(key, {}).get('tx', 0)
                 
                 # Get queue drops
-                queue_drops = self.get_delta_value(device_ip, port_name, 'tx_queue_drop', sfp.get('tx_queue_drop', 0))
+                queue_drops = self.get_delta_value(device_ip, port_name, 'tx_queue_drop', port.get('tx_queue_drop', 0))
                 
                 # Get link flap/down info
                 link_info = self.link_state_history.get(key, {})
                 flap_count = link_info.get('flap_count', 0)
-                link_downs = self.get_delta_value(device_ip, port_name, 'link_downs', sfp.get('link_downs', 0))
-                total_link_downs = sfp.get('link_downs', 0)  # Total count since boot
+                link_downs = self.get_delta_value(device_ip, port_name, 'link_downs', port.get('link_downs', 0))
+                total_link_downs = port.get('link_downs', 0)  # Total count since boot
                 
                 # Track if port is currently down
-                is_down = sfp.get('status', 'unknown') not in ['link-ok', 'running']
+                is_down = port.get('status', 'unknown') not in ['link-ok', 'running']
+                
+                # Skip ports that are down or have no link
+                if is_down or 'no-link' in port.get('status', '').lower():
+                    continue
                 
                 all_ports.append({
                     'device': device['hostname'],
                     'ip': device['host'],
-                    'port': sfp['interface'],
-                    'status': sfp.get('status', 'unknown'),
-                    'rate': sfp.get('rate', 'N/A'),
-                    'rx_power': sfp.get('sfp_rx_power', 'N/A'),
-                    'tx_power': sfp.get('sfp_tx_power', 'N/A'),
-                    'temp': sfp.get('sfp_temperature', 'N/A'),
+                    'port': port['interface'],
+                    'status': port.get('status', 'unknown'),
+                    'rate': port.get('rate', 'N/A'),
+                    'rx_power': port.get('sfp_rx_power', 'N/A'),
+                    'tx_power': port.get('sfp_tx_power', 'N/A'),
+                    'temp': port.get('sfp_temperature', 'N/A'),
+                    'is_sfp': port.get('is_sfp', False),
                     'errors': total_errors,
                     'fcs': fcs_errors,
                     'align': align_errors,
@@ -845,15 +758,6 @@ class MikroTikSFPCollector:
                     'total_link_downs': total_link_downs,
                     'is_down': is_down
                 })
-        
-        # Show ports with link issues
-        down_ports = [p for p in all_ports if p['is_down']]
-        if down_ports:
-            output_lines.append(f"\n{Fore.RED}{Style.BRIGHT}[!] PORTS CURRENTLY DOWN:{Style.RESET_ALL}")
-            output_lines.append(f"{Fore.RED}{'-'*80}{Style.RESET_ALL}")
-            for port in down_ports:
-                output_lines.append(f"{Fore.RED}[DOWN]{Style.RESET_ALL} {port['device']:20s} {port['port']:15s} - "
-                      f"Total downs: {port['total_link_downs']}")
         
         # Show ports with errors
         error_ports = [p for p in all_ports if p['errors'] > 0]
@@ -944,8 +848,8 @@ class MikroTikSFPCollector:
                       f"Rate: {rate_str}")
                 output_lines.append(f"    {Fore.CYAN}Error Breakdown:{Style.RESET_ALL} {error_detail_str}")
         
-        # Show all ports status in compact format
-        output_lines.append(f"\n{Fore.GREEN}{Style.BRIGHT}[*] ALL PORTS STATUS:{Style.RESET_ALL}")
+        # Show all active ports status in compact format (SFP and Ethernet)
+        output_lines.append(f"\n{Fore.GREEN}{Style.BRIGHT}[*] ACTIVE PORTS STATUS (LINK-OK ONLY):{Style.RESET_ALL}")
         output_lines.append(f"{Fore.GREEN}{'-'*165}{Style.RESET_ALL}")
         # Build header with proper spacing - adjusted to match data alignment
         header = (f"{Fore.WHITE}{Style.BRIGHT}"
@@ -965,14 +869,34 @@ class MikroTikSFPCollector:
         output_lines.append(header)
         output_lines.append(f"{Fore.WHITE}{'-'*165}{Style.RESET_ALL}")
         
-        # Sort ports by IP address first, then by port name
+        # Sort ports: SFP first, then by speed (highest to lowest), then by IP
         def port_sort_key(port):
             try:
                 ip_parts = port['ip'].split('.')
                 ip_tuple = tuple(int(part) for part in ip_parts)
             except:
                 ip_tuple = (999, 999, 999, 999)
-            return (ip_tuple, port['port'])
+            
+            # Determine speed priority (higher number = higher priority)
+            speed_priority = 0
+            rate = port['rate']
+            if '10Gbps' in str(rate):
+                speed_priority = 10000
+            elif '5Gbps' in str(rate):
+                speed_priority = 5000
+            elif '2.5Gbps' in str(rate):
+                speed_priority = 2500
+            elif '1Gbps' in str(rate):
+                speed_priority = 1000
+            elif '100Mbps' in str(rate):
+                speed_priority = 100
+            elif '10Mbps' in str(rate):
+                speed_priority = 10
+            else:
+                speed_priority = 1
+            
+            # Sort by: SFP first (0 for SFP, 1 for regular), then by speed (descending), then by IP and port name
+            return (0 if port['is_sfp'] else 1, -speed_priority, ip_tuple, port['port'])
         
         for port in sorted(all_ports, key=port_sort_key):
             # Use the pre-calculated traffic rates
@@ -1088,11 +1012,19 @@ class MikroTikSFPCollector:
             else:
                 power_str = f"{'N/A':^13}"
             
-            # Color code rate
+            # Color code rate with warning for sub-gigabit speeds
             if '10Gbps' in port['rate']:
                 rate_color = Fore.CYAN
+            elif '5Gbps' in port['rate']:
+                rate_color = Fore.MAGENTA
+            elif '2.5Gbps' in port['rate']:
+                rate_color = Fore.BLUE
             elif '1Gbps' in port['rate']:
                 rate_color = Fore.GREEN
+            elif '100Mbps' in port['rate']:
+                rate_color = Fore.YELLOW  # Warning for 100Mbps
+            elif '10Mbps' in port['rate']:
+                rate_color = Fore.RED     # Critical for 10Mbps
             else:
                 rate_color = Fore.WHITE
             
@@ -1126,9 +1058,13 @@ class MikroTikSFPCollector:
             
             # Build formatted row with proper alignment
             # The strings already contain color codes, so just print with spaces
+            # Add indicator for SFP vs regular ethernet ports
+            port_indicator = f"{Fore.CYAN}[SFP]{Style.RESET_ALL} " if port.get('is_sfp') else f"{Fore.BLUE}[ETH]{Style.RESET_ALL} "
+            port_name_display = f"{port_indicator}{port['port']:<10}"
+            
             # Adjust spacing to move errors and following columns to the right
             output_lines.append(f"{Fore.WHITE}{port['device']:<20}{Style.RESET_ALL} "
-                  f"{Fore.WHITE}{port['port']:<15}{Style.RESET_ALL} "
+                  f"{port_name_display} "
                   f"{status_color}{status_text:<10}{Style.RESET_ALL} "
                   f"{traffic_color}{traffic_str:<16}{Style.RESET_ALL} "
                   f"{rate_color}{port['rate']:<8}{Style.RESET_ALL} "
@@ -1140,19 +1076,6 @@ class MikroTikSFPCollector:
                   f"{ldown_str}       "  # Add 7 spaces for link downs
                   f"{flap_str}")
         
-        # Show ports with frequent link downs
-        unstable_ports = [p for p in all_ports if p['link_downs'] > 0 or p['link_flaps'] > 0]
-        if unstable_ports:
-            output_lines.append(f"\n{Fore.YELLOW}{Style.BRIGHT}[!] LINK STABILITY ISSUES:{Style.RESET_ALL}")
-            for port in sorted(unstable_ports, key=lambda x: x['link_downs'] + x['link_flaps'], reverse=True)[:5]:
-                stability_info = []
-                if port['link_downs'] > 0:
-                    stability_info.append(f"Link Downs: {port['link_downs']}")
-                if port['link_flaps'] > 0:
-                    stability_info.append(f"Flaps: {port['link_flaps']}")
-                if port['total_link_downs'] > 0:
-                    stability_info.append(f"Total Downs Since Boot: {port['total_link_downs']}")
-                output_lines.append(f"  {port['device']:20s} {port['port']:15s} - {', '.join(stability_info)}")
         
         # Show packet size distribution for ports with traffic
         active_ports = [p for p in all_ports if p['rx_mbps'] + p['tx_mbps'] > 10]  # Only ports with >10Mbps
@@ -1195,26 +1118,6 @@ class MikroTikSFPCollector:
                     error_types.append(f"Overflow: {port['overflow']}")
                 
                 output_lines.append(f"  {port['device']:20s} {port['port']:15s} - {', '.join(error_types)}")
-        
-        # Show legend
-        output_lines.append(f"\n{Fore.CYAN}{Style.BRIGHT}[*] LEGEND:{Style.RESET_ALL}")
-        output_lines.append(f"  Traffic (RX/TX Mbps): {Fore.BLUE}* Idle{Style.RESET_ALL} | "
-              f"{Fore.GREEN}* 10+{Style.RESET_ALL} | "
-              f"{Fore.CYAN}* 100+{Style.RESET_ALL} | "
-              f"{Fore.YELLOW}* 1G+{Style.RESET_ALL} | "
-              f"{Fore.MAGENTA}* 5G+{Style.RESET_ALL} | "
-              f"{Fore.RED}* 8G+{Style.RESET_ALL}")
-        output_lines.append(f"  Power RX (dBm): {Fore.RED}* <-30 (Very Weak){Style.RESET_ALL} | "
-              f"{Fore.YELLOW}* -30 to -20 (Weak){Style.RESET_ALL} | "
-              f"{Fore.GREEN}* -20 to -7 (Good){Style.RESET_ALL} | "
-              f"{Fore.CYAN}* -7 to -3 (Strong){Style.RESET_ALL} | "
-              f"{Fore.MAGENTA}* >-3 (Very Strong){Style.RESET_ALL}")
-        output_lines.append(f"  Power TX (dBm): {Fore.RED}* <-10 (Very Weak){Style.RESET_ALL} | "
-              f"{Fore.YELLOW}* -10 to -5 (Weak){Style.RESET_ALL} | "
-              f"{Fore.GREEN}* -5 to 0 (Good){Style.RESET_ALL} | "
-              f"{Fore.CYAN}* >0 (Strong){Style.RESET_ALL}")
-        output_lines.append(f"  Error Types: FCS = Frame Check Sequence | Q-Drop = Queue Drops | L-Down = Link Down Events | Flaps = Link State Changes")
-        output_lines.append(f"  EPM = Errors Per Million packets | Align = Alignment Errors | Frag = Fragmented Packets")
         
         output_lines.append(f"\n{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
         output_lines.append(f"{Fore.YELLOW}Press 'R' to reset counters | Ctrl+C to stop monitoring{Style.RESET_ALL}")
@@ -1383,7 +1286,7 @@ class MikroTikSFPCollector:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Monitor SFP port statistics from MikroTik routers using MNDP discovery')
+    parser = argparse.ArgumentParser(description='Monitor SFP port statistics from MikroTik routers')
     parser.add_argument('-u', '--username', required=True, help='RouterOS username')
     parser.add_argument('-p', '--password', required=True, help='RouterOS password')
     parser.add_argument('--port', type=int, default=8728, help='RouterOS API port (default: 8728)')
@@ -1392,8 +1295,6 @@ def main():
     parser.add_argument('--interval', type=int, default=1, help='Refresh interval in seconds (default: 1)')
     parser.add_argument('-c', '--config', type=str, default='mikrotik_hosts.txt',
                        help='Path to hosts configuration file (default: mikrotik_hosts.txt)')
-    parser.add_argument('--no-discovery', action='store_true',
-                       help='Disable MNDP discovery and only use config file')
     
     args = parser.parse_args()
     
@@ -1406,74 +1307,25 @@ def main():
         use_ssh=False
     )
     
-    # Start with continuous discovery and monitoring
-    print("Starting MikroTik SFP Monitor with continuous device discovery...")
+    # Start monitoring immediately
+    print("Starting MikroTik SFP Monitor...")
     print(f"Refresh interval: {args.interval} second(s)")
     print("Press 'R' to reset counters, Ctrl+C to stop...\n")
     
-    # Load hosts from config file first
+    # Load hosts from config file
     print(f"Loading hosts from configuration file: {args.config}")
     config_hosts = collector.load_hosts_from_file(args.config)
     
-    # Shared list of discovered hosts (thread-safe)
-    discovered_hosts = set(config_hosts)  # Initialize with config hosts
-    hosts_lock = threading.Lock()
-    
     if config_hosts:
         print(f"  Loaded {len(config_hosts)} host(s) from config file")
-    
-    if args.no_discovery:
-        print("  MNDP discovery disabled - using only config file hosts")
-    elif not config_hosts:
-        print("  No hosts found in config file, relying on MNDP discovery")
+        print("  Starting monitoring immediately...\n")
     else:
-        print("  Will also use MNDP discovery to find additional devices")
+        print(f"  ERROR: No hosts found in config file: {args.config}")
+        print("  Please add IP addresses to the config file (one per line)")
+        sys.exit(1)
     
-    # Discovery thread - continuously discovers devices (skip if disabled)
-    def continuous_discovery():
-        discovery_count = 0
-        while True:
-            try:
-                # More aggressive discovery for first minute
-                if discovery_count < 12:  # First 12 attempts (1 minute)
-                    timeout = 8
-                    sleep_time = 5  # Every 5 seconds initially
-                else:
-                    timeout = 5
-                    sleep_time = 15  # Every 15 seconds after initial period
-                
-                devices = collector.discover_mikrotik_devices(timeout=timeout)
-                if devices:
-                    with hosts_lock:
-                        for device in devices:
-                            if device['ip'] not in discovered_hosts:
-                                discovered_hosts.add(device['ip'])
-                                print(f"\n[NEW DEVICE] Found: {device['identity']} ({device['ip']})")
-                discovery_count += 1
-                time.sleep(sleep_time)
-            except:
-                time.sleep(5)
-    
-    # Start discovery thread only if not disabled
-    if not args.no_discovery:
-        discovery_thread = threading.Thread(target=continuous_discovery, daemon=True)
-        discovery_thread.start()
-        
-        # Initial discovery with longer timeout - do it twice for better coverage
-        print("Performing initial device discovery (this may take up to 30 seconds)...")
-        for attempt in range(2):
-            devices = collector.discover_mikrotik_devices(timeout=10)
-            if devices:
-                for device in devices:
-                    if device['ip'] not in discovered_hosts:
-                        discovered_hosts.add(device['ip'])
-                        print(f"  - {device['identity']} ({device['ip']}")
-            if attempt == 0:
-                time.sleep(2)  # Short pause between attempts
-    
-    # Start monitoring even if no devices initially found
-    if True:  # Always start monitoring
-        time.sleep(2)
+    # Start monitoring immediately without any delays
+    if config_hosts:
         
         # Flag for reset request
         reset_requested = threading.Event()
@@ -1498,15 +1350,8 @@ def main():
             iteration = 0
             
             while True:
-                # Get current list of hosts
-                with hosts_lock:
-                    current_hosts = list(discovered_hosts)
-                
-                # Skip if no hosts discovered yet
-                if not current_hosts:
-                    print("\rWaiting for devices to be discovered...", end="")
-                    time.sleep(1)
-                    continue
+                # Use config hosts directly
+                current_hosts = config_hosts
                 
                 # Check for reset request
                 if reset_requested.is_set():
