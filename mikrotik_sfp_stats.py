@@ -208,6 +208,7 @@ class MikroTikSFPCollector:
             'host': host,
             'hostname': 'Unknown',
             'sfp_ports': [],
+            'ethernet_ports': [],  # Add ethernet ports collection
             'error': None
         }
         
@@ -703,30 +704,31 @@ class MikroTikSFPCollector:
     
     def print_monitoring_summary(self, device_count=0):
         """Print compact monitoring summary for terminal - errors and rates only"""
-        # Only clear screen every 5 seconds to reduce blinking
-        current_time = time.time()
-        if current_time - self.last_clear_time > 5:
-            os.system('cls' if os.name == 'nt' else 'clear')
-            self.last_clear_time = current_time
-        else:
-            # Move cursor to home position instead of clearing
-            if os.name == 'nt':
-                os.system('cls')  # Windows doesn't support ANSI cursor movement well
-            else:
-                print('\033[H\033[J', end='')  # ANSI escape code for clear screen
+        # Build entire output in memory first (double buffering)
+        output_lines = []
+        
+        # Enable ANSI escape codes on Windows 10+
+        if os.name == 'nt':
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                # Enable ANSI escape code processing
+                kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+            except:
+                pass
         
         # Header with timestamp
-        print(f"{Fore.CYAN}{Style.BRIGHT}{'='*80}{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}{Style.BRIGHT}MIKROTIK SFP MONITORING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{Style.RESET_ALL}")
-        print(f"{Fore.YELLOW}Monitoring {device_count} device(s) - Discovery running in background{Style.RESET_ALL}")
+        output_lines.append(f"{Fore.CYAN}{Style.BRIGHT}{'='*80}{Style.RESET_ALL}")
+        output_lines.append(f"{Fore.CYAN}{Style.BRIGHT}MIKROTIK SFP MONITORING - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{Style.RESET_ALL}")
+        output_lines.append(f"{Fore.YELLOW}Monitoring {device_count} device(s) - Discovery running in background{Style.RESET_ALL}")
         if self.reset_time:
             elapsed = (datetime.now() - self.reset_time).total_seconds()
-            print(f"{Fore.GREEN}Counters reset {int(elapsed)} seconds ago - showing delta values{Style.RESET_ALL}")
-        print(f"{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
+            output_lines.append(f"{Fore.GREEN}Counters reset {int(elapsed)} seconds ago - showing delta values{Style.RESET_ALL}")
+        output_lines.append(f"{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
         
         # Show device versions - SORTED BY IP ADDRESS
-        print(f"\n{Fore.BLUE}{Style.BRIGHT}[DEVICE INFO]{Style.RESET_ALL}")
-        print(f"{Fore.BLUE}{'-'*80}{Style.RESET_ALL}")
+        output_lines.append(f"\n{Fore.BLUE}{Style.BRIGHT}[DEVICE INFO]{Style.RESET_ALL}")
+        output_lines.append(f"{Fore.BLUE}{'-'*80}{Style.RESET_ALL}")
         
         # Sort devices by IP address for consistent ordering
         devices_to_show = []
@@ -754,7 +756,7 @@ class MikroTikSFPCollector:
             # Color code CPU load
             cpu_color = Fore.GREEN if cpu < 50 else Fore.YELLOW if cpu < 80 else Fore.RED
             
-            print(f"{Fore.WHITE}{device['hostname']:20s} ({device['host']:15s}) | "
+            output_lines.append(f"{Fore.WHITE}{device['hostname']:20s} ({device['host']:15s}) | "
                   f"RouterOS: {Fore.GREEN}{version:12s}{Fore.WHITE} | "
                   f"Firmware: {Fore.GREEN}{rb_version:8s}{Fore.WHITE} | "
                   f"Model: {Fore.CYAN}{model:15s}{Fore.WHITE} | "
@@ -847,17 +849,17 @@ class MikroTikSFPCollector:
         # Show ports with link issues
         down_ports = [p for p in all_ports if p['is_down']]
         if down_ports:
-            print(f"\n{Fore.RED}{Style.BRIGHT}[!] PORTS CURRENTLY DOWN:{Style.RESET_ALL}")
-            print(f"{Fore.RED}{'-'*80}{Style.RESET_ALL}")
+            output_lines.append(f"\n{Fore.RED}{Style.BRIGHT}[!] PORTS CURRENTLY DOWN:{Style.RESET_ALL}")
+            output_lines.append(f"{Fore.RED}{'-'*80}{Style.RESET_ALL}")
             for port in down_ports:
-                print(f"{Fore.RED}[DOWN]{Style.RESET_ALL} {port['device']:20s} {port['port']:15s} - "
+                output_lines.append(f"{Fore.RED}[DOWN]{Style.RESET_ALL} {port['device']:20s} {port['port']:15s} - "
                       f"Total downs: {port['total_link_downs']}")
         
         # Show ports with errors
         error_ports = [p for p in all_ports if p['errors'] > 0]
         if error_ports:
-            print(f"\n{Fore.RED}{Style.BRIGHT}[!] PORTS WITH ERRORS:{Style.RESET_ALL}")
-            print(f"{Fore.RED}{'-'*80}{Style.RESET_ALL}")
+            output_lines.append(f"\n{Fore.RED}{Style.BRIGHT}[!] PORTS WITH ERRORS:{Style.RESET_ALL}")
+            output_lines.append(f"{Fore.RED}{'-'*80}{Style.RESET_ALL}")
             # Sort by errors (descending) but then by IP for consistency when errors are equal
             def error_sort_key(port):
                 try:
@@ -936,15 +938,15 @@ class MikroTikSFPCollector:
                 
                 error_detail_str = ' | '.join(error_details) if error_details else f"{Fore.YELLOW}Mixed errors{Style.RESET_ALL}"
                 
-                print(f"{status_indicator} {color}{port['device']:20s} {port['port']:15s}{Style.RESET_ALL} | "
+                output_lines.append(f"{status_indicator} {color}{port['device']:20s} {port['port']:15s}{Style.RESET_ALL} | "
                       f"Total: {Fore.WHITE}{port['errors']:7d}{Style.RESET_ALL} | "
                       f"Last 10s: {errors_10s_str} | Last 60s: {errors_60s_str} | "
                       f"Rate: {rate_str}")
-                print(f"    {Fore.CYAN}Error Breakdown:{Style.RESET_ALL} {error_detail_str}")
+                output_lines.append(f"    {Fore.CYAN}Error Breakdown:{Style.RESET_ALL} {error_detail_str}")
         
         # Show all ports status in compact format
-        print(f"\n{Fore.GREEN}{Style.BRIGHT}[*] ALL PORTS STATUS:{Style.RESET_ALL}")
-        print(f"{Fore.GREEN}{'-'*165}{Style.RESET_ALL}")
+        output_lines.append(f"\n{Fore.GREEN}{Style.BRIGHT}[*] ALL PORTS STATUS:{Style.RESET_ALL}")
+        output_lines.append(f"{Fore.GREEN}{'-'*165}{Style.RESET_ALL}")
         # Build header with proper spacing - adjusted to match data alignment
         header = (f"{Fore.WHITE}{Style.BRIGHT}"
                   f"{'Device':<20} "  
@@ -960,8 +962,8 @@ class MikroTikSFPCollector:
                   f"{'L-Down':<7} "  # Link Downs
                   f"{'Flaps':<5}"    
                   f"{Style.RESET_ALL}")
-        print(header)
-        print(f"{Fore.WHITE}{'-'*165}{Style.RESET_ALL}")
+        output_lines.append(header)
+        output_lines.append(f"{Fore.WHITE}{'-'*165}{Style.RESET_ALL}")
         
         # Sort ports by IP address first, then by port name
         def port_sort_key(port):
@@ -1125,7 +1127,7 @@ class MikroTikSFPCollector:
             # Build formatted row with proper alignment
             # The strings already contain color codes, so just print with spaces
             # Adjust spacing to move errors and following columns to the right
-            print(f"{Fore.WHITE}{port['device']:<20}{Style.RESET_ALL} "
+            output_lines.append(f"{Fore.WHITE}{port['device']:<20}{Style.RESET_ALL} "
                   f"{Fore.WHITE}{port['port']:<15}{Style.RESET_ALL} "
                   f"{status_color}{status_text:<10}{Style.RESET_ALL} "
                   f"{traffic_color}{traffic_str:<16}{Style.RESET_ALL} "
@@ -1141,7 +1143,7 @@ class MikroTikSFPCollector:
         # Show ports with frequent link downs
         unstable_ports = [p for p in all_ports if p['link_downs'] > 0 or p['link_flaps'] > 0]
         if unstable_ports:
-            print(f"\n{Fore.YELLOW}{Style.BRIGHT}[!] LINK STABILITY ISSUES:{Style.RESET_ALL}")
+            output_lines.append(f"\n{Fore.YELLOW}{Style.BRIGHT}[!] LINK STABILITY ISSUES:{Style.RESET_ALL}")
             for port in sorted(unstable_ports, key=lambda x: x['link_downs'] + x['link_flaps'], reverse=True)[:5]:
                 stability_info = []
                 if port['link_downs'] > 0:
@@ -1150,33 +1152,33 @@ class MikroTikSFPCollector:
                     stability_info.append(f"Flaps: {port['link_flaps']}")
                 if port['total_link_downs'] > 0:
                     stability_info.append(f"Total Downs Since Boot: {port['total_link_downs']}")
-                print(f"  {port['device']:20s} {port['port']:15s} - {', '.join(stability_info)}")
+                output_lines.append(f"  {port['device']:20s} {port['port']:15s} - {', '.join(stability_info)}")
         
         # Show packet size distribution for ports with traffic
         active_ports = [p for p in all_ports if p['rx_mbps'] + p['tx_mbps'] > 10]  # Only ports with >10Mbps
         if active_ports and len(active_ports) <= 3:  # Show for up to 3 active ports
-            print(f"\n{Fore.BLUE}{Style.BRIGHT}[*] PACKET SIZE DISTRIBUTION:{Style.RESET_ALL}")
+            output_lines.append(f"\n{Fore.BLUE}{Style.BRIGHT}[*] PACKET SIZE DISTRIBUTION:{Style.RESET_ALL}")
             for port in active_ports[:3]:
                 dist = self.get_packet_size_distribution(port['ip'], port['port'])
                 if dist:
-                    print(f"  {port['device']} {port['port']}:", end="")
+                    line = f"  {port['device']} {port['port']}:"
                     for size, percent in dist.items():
                         if percent > 1:  # Only show sizes with >1%
                             color = Fore.YELLOW if percent > 50 else Fore.CYAN if percent > 20 else Fore.WHITE
-                            print(f" {color}{size}:{percent:.0f}%{Style.RESET_ALL}", end="")
-                    print()
+                            line += f" {color}{size}:{percent:.0f}%{Style.RESET_ALL}"
+                    output_lines.append(line)
         
         # Show ports with pause frames
         pause_ports = [p for p in all_ports if p['pause_frames'] > 0]
         if pause_ports:
-            print(f"\n{Fore.YELLOW}{Style.BRIGHT}[!] FLOW CONTROL ACTIVE (Pause Frames):{Style.RESET_ALL}")
+            output_lines.append(f"\n{Fore.YELLOW}{Style.BRIGHT}[!] FLOW CONTROL ACTIVE (Pause Frames):{Style.RESET_ALL}")
             for port in pause_ports[:5]:  # Show up to 5 ports
-                print(f"  {port['device']:20s} {port['port']:15s} - {port['pause_frames']} frames")
+                output_lines.append(f"  {port['device']:20s} {port['port']:15s} - {port['pause_frames']} frames")
         
         # Show detailed error breakdown for ports with significant errors
         significant_error_ports = [p for p in all_ports if p['errors'] > 10]
         if significant_error_ports:
-            print(f"\n{Fore.YELLOW}{Style.BRIGHT}[!] ERROR DETAILS:{Style.RESET_ALL}")
+            output_lines.append(f"\n{Fore.YELLOW}{Style.BRIGHT}[!] ERROR DETAILS:{Style.RESET_ALL}")
             for port in significant_error_ports[:5]:  # Show up to 5 ports
                 error_types = []
                 if port['fcs'] > 0:
@@ -1192,30 +1194,35 @@ class MikroTikSFPCollector:
                 if port['overflow'] > 0:
                     error_types.append(f"Overflow: {port['overflow']}")
                 
-                print(f"  {port['device']:20s} {port['port']:15s} - {', '.join(error_types)}")
+                output_lines.append(f"  {port['device']:20s} {port['port']:15s} - {', '.join(error_types)}")
         
         # Show legend
-        print(f"\n{Fore.CYAN}{Style.BRIGHT}[*] LEGEND:{Style.RESET_ALL}")
-        print(f"  Traffic (RX/TX Mbps): {Fore.BLUE}* Idle{Style.RESET_ALL} | "
+        output_lines.append(f"\n{Fore.CYAN}{Style.BRIGHT}[*] LEGEND:{Style.RESET_ALL}")
+        output_lines.append(f"  Traffic (RX/TX Mbps): {Fore.BLUE}* Idle{Style.RESET_ALL} | "
               f"{Fore.GREEN}* 10+{Style.RESET_ALL} | "
               f"{Fore.CYAN}* 100+{Style.RESET_ALL} | "
               f"{Fore.YELLOW}* 1G+{Style.RESET_ALL} | "
               f"{Fore.MAGENTA}* 5G+{Style.RESET_ALL} | "
               f"{Fore.RED}* 8G+{Style.RESET_ALL}")
-        print(f"  Power RX (dBm): {Fore.RED}* <-30 (Very Weak){Style.RESET_ALL} | "
+        output_lines.append(f"  Power RX (dBm): {Fore.RED}* <-30 (Very Weak){Style.RESET_ALL} | "
               f"{Fore.YELLOW}* -30 to -20 (Weak){Style.RESET_ALL} | "
               f"{Fore.GREEN}* -20 to -7 (Good){Style.RESET_ALL} | "
               f"{Fore.CYAN}* -7 to -3 (Strong){Style.RESET_ALL} | "
               f"{Fore.MAGENTA}* >-3 (Very Strong){Style.RESET_ALL}")
-        print(f"  Power TX (dBm): {Fore.RED}* <-10 (Very Weak){Style.RESET_ALL} | "
+        output_lines.append(f"  Power TX (dBm): {Fore.RED}* <-10 (Very Weak){Style.RESET_ALL} | "
               f"{Fore.YELLOW}* -10 to -5 (Weak){Style.RESET_ALL} | "
               f"{Fore.GREEN}* -5 to 0 (Good){Style.RESET_ALL} | "
               f"{Fore.CYAN}* >0 (Strong){Style.RESET_ALL}")
-        print(f"  Error Types: FCS = Frame Check Sequence | Q-Drop = Queue Drops | L-Down = Link Down Events | Flaps = Link State Changes")
-        print(f"  EPM = Errors Per Million packets | Align = Alignment Errors | Frag = Fragmented Packets")
+        output_lines.append(f"  Error Types: FCS = Frame Check Sequence | Q-Drop = Queue Drops | L-Down = Link Down Events | Flaps = Link State Changes")
+        output_lines.append(f"  EPM = Errors Per Million packets | Align = Alignment Errors | Frag = Fragmented Packets")
         
-        print(f"\n{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
-        print(f"{Fore.YELLOW}Press 'R' to reset counters | Ctrl+C to stop monitoring{Style.RESET_ALL}")
+        output_lines.append(f"\n{Fore.CYAN}{'='*80}{Style.RESET_ALL}")
+        output_lines.append(f"{Fore.YELLOW}Press 'R' to reset counters | Ctrl+C to stop monitoring{Style.RESET_ALL}")
+        
+        # Now write everything at once with cursor positioning
+        # Clear screen and move cursor to home
+        output = '\033[H\033[2J' + '\n'.join(output_lines)
+        print(output, end='', flush=True)
     
     def print_results(self):
         """Print collected results to terminal"""
@@ -1504,8 +1511,7 @@ def main():
                 # Check for reset request
                 if reset_requested.is_set():
                     reset_requested.clear()
-                    # Clear screen and show reset message
-                    os.system('cls' if os.name == 'nt' else 'clear')
+                    # Don't clear screen here - let the summary function handle it
                     collector.reset_interface_counters(current_hosts)
                     iteration = 0  # Reset iteration counter
                     continue
